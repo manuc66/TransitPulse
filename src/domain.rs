@@ -118,10 +118,18 @@ impl Evidence {
 #[derive(Debug, Clone, Serialize)]
 pub struct StopStatus {
     pub stop: Stop,
+    /// Lignes desservant l'arrêt **dans la fenêtre courante** (avec passages).
     pub lines: Vec<LineStatus>,
+    /// Toutes les lignes qui desservent habituellement cet arrêt, même hors
+    /// service (ex. « quelles lignes passent ici ? » à 23 h). Évite un écran vide.
+    pub served_lines: Vec<Line>,
     pub last_updated: Option<DateTime<Utc>>,
     pub feed_age_secs: Option<u64>,
     pub advice: String,
+    /// Précision temporelle quand aucune ligne n'a de passage imminent
+    /// (ex. « service terminé, dernier passage à 20:12 »).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_note: Option<String>,
     /// Contexte systémique : état du réseau dans la commune de l'arrêt,
     /// pour distinguer « mon bus est en retard » de « tout le réseau est à l'arrêt ».
     #[serde(skip_serializing_if = "Option::is_none")]

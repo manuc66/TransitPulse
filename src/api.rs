@@ -69,8 +69,8 @@ struct SearchParams {
 
 #[derive(Serialize)]
 struct SearchResult {
-    /// Arrêts correspondant au nom recherché.
-    stops: Vec<crate::gtfs::NearbyStop>,
+    /// Arrêts proposés, avec distance et destinations (pour choisir le bon quai).
+    stops: Vec<crate::gtfs::StopChoice>,
     /// Si la requête a été comprise comme une adresse : point géocodé.
     #[serde(skip_serializing_if = "Option::is_none")]
     origin: Option<crate::geo::Geocoded>,
@@ -89,89 +89,60 @@ async fn search(
     Query(p): Query<SearchParams>,
 ) -> Json<SearchResult> {
     let Some(gtfs) = &state.gtfs else {
-        let stops = state
-            .repo
-            .search(&p.q)
-            .into_iter()
-            .map(Into::into)
-            .collect();
         return Json(SearchResult {
-            stops,
+            stops: Vec::new(),
             origin: None,
-            note: None,
+            note: Some("GTFS non chargé".into()),
         });
     };
 
-    // 1) Recherche par nom d'arrêt.
-    let by_name = gtfs
-        .lock()
-        .expect("gtfs mutex")
-        .search_stops(&p.q, 10)
-        .unwrap_or_default();
-    if !by_name.is_empty() && !looks_like_address(&p.q) {
-        return Json(SearchResult {
-            stops: nearby_from_stops(gtfs, &by_name),
-            origin: None,
-            note: None,
-        });
+    // 1) Recherche par nom d'arrêt (sans géocodage si pas d'adresse).
+    if !looks_like_address(&p.q) {
+        let choices = {
+            let guard = gtfs.lock().expect("gtfs mutex");
+            let by_name = guard.search_stops(&p.q, 12).unwrap_or_default();
+            let nearby: Vec<_> = by_name.into_iter().map(Into::into).collect();
+            guard.to_choices(nearby, false).unwrap_or_default()
+        };
+        if !choices.is_empty() {
+            return Json(SearchResult {
+                stops: choices,
+                origin: None,
+                note: None,
+            });
+        }
     }
 
-    // 2) Aucun arrêt (ou adresse) : géocodage puis arrêts les plus proches.
+    // 2) Adresse (ou nom sans résultat) : géocodage puis arrêts les plus proches,
+    //    classés par distance et enrichis des destinations.
     match crate::geo::geocode(&state.http, &p.q).await {
         Ok(Some(g)) => {
             let radius = 1200.0;
-            let stops = gtfs
-                .lock()
-                .expect("gtfs mutex")
-                .nearby_stops(g.lat, g.lon, radius)
-                .unwrap_or_default();
-            let note = if stops.is_empty() {
+            let choices = {
+                let guard = gtfs.lock().expect("gtfs mutex");
+                let nearby = guard.nearby_stops(g.lat, g.lon, radius).unwrap_or_default();
+                guard.to_choices(nearby, false).unwrap_or_default()
+            };
+            let note = if choices.is_empty() {
                 Some(format!(
-                    "Aucun arrêt dans un rayon de {radius:.0} m autour de « {} »",
+                    "Aucun arrêt desservi dans un rayon de {radius:.0} m autour de « {} »",
                     g.label
                 ))
             } else {
                 None
             };
             Json(SearchResult {
-                stops,
+                stops: choices,
                 origin: Some(g),
                 note,
             })
         }
-        _ => {
-            // Repli : renvoie ce que la recherche par nom a trouvé (souvent vide).
-            Json(SearchResult {
-                stops: nearby_from_stops(gtfs, &by_name),
-                origin: None,
-                note: if by_name.is_empty() {
-                    Some("Adresse introuvable".to_string())
-                } else {
-                    None
-                },
-            })
-        }
+        _ => Json(SearchResult {
+            stops: Vec::new(),
+            origin: None,
+            note: Some("Adresse introuvable".to_string()),
+        }),
     }
-}
-
-/// Convertit des `Stop` (sans distance) en `NearbyStop` (distance inconnue = 0,
-/// desservi à vérifier côté requête).
-fn nearby_from_stops(
-    gtfs: &Arc<Mutex<GtfsRepo>>,
-    stops: &[crate::domain::Stop],
-) -> Vec<crate::gtfs::NearbyStop> {
-    let guard = gtfs.lock().expect("gtfs mutex");
-    stops
-        .iter()
-        .map(|s| {
-            let served = guard.stop_is_served(&s.stop_id).unwrap_or(false);
-            crate::gtfs::NearbyStop {
-                stop: s.clone(),
-                metres: 0.0,
-                served,
-            }
-        })
-        .collect()
 }
 
 #[derive(Deserialize)]

@@ -144,11 +144,58 @@ impl StatusService {
         }
         lines.sort_by(|a, b| a.line.short_name.cmp(&b.line.short_name));
 
+        // Lignes desservant habituellement l'arrêt (indépendamment de l'heure) :
+        // répond à « quelles lignes passent ici ? » même en dehors du service.
+        let mut served_lines = Vec::new();
+        for s in &stops {
+            for line in self.repo.lines_for_stop(&s.stop_id)? {
+                if !served_lines
+                    .iter()
+                    .any(|l: &crate::domain::Line| l.route_id == line.route_id)
+                {
+                    served_lines.push(line);
+                }
+            }
+        }
+        served_lines.sort_by(|a, b| a.short_name.cmp(&b.short_name));
+
+        // Précision temporelle : service terminé ? pas encore commencé ?
+        let stop_ids: Vec<String> = stops.iter().map(|s| s.stop_id.clone()).collect();
+        let extent = self.repo.day_extent(&stop_ids, &services)?;
+        let service_note = if lines.is_empty() {
+            match extent {
+                Some((_, last)) if now_secs > last => Some(format!(
+                    "Service terminé pour aujourd'hui (dernier passage vers {})",
+                    hhmm(last)
+                )),
+                Some((first, _)) if now_secs < first => Some(format!(
+                    "Service non commencé (premier passage vers {})",
+                    hhmm(first)
+                )),
+                _ if services.is_empty() => {
+                    Some("Aucun service prévu aujourd'hui à cet arrêt".to_string())
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         let worst = lines
             .iter()
             .map(|l| l.status)
             .min_by_key(|s| severity_rank(*s))
             .unwrap_or(ServiceStatus::Unknown);
+
+        // L'aide reflète le contexte réel : lignes présentes, service terminé…
+        let advice = if lines.is_empty() {
+            match &service_note {
+                Some(note) => note.clone(),
+                None => "Aucun passage prévu dans l'heure qui vient à cet arrêt".to_string(),
+            }
+        } else {
+            domain::advice(worst).to_string()
+        };
 
         // Contexte systémique de la commune de l'arrêt.
         let network = self.network_context(&stop.name)?;
@@ -156,9 +203,11 @@ impl StatusService {
         Ok(Some(StopStatus {
             stop,
             lines,
+            served_lines,
             last_updated: feed_age.map(|a| Utc::now() - chrono::Duration::seconds(a)),
             feed_age_secs: feed_age.map(|a| a.max(0) as u64),
-            advice: domain::advice(worst).to_string(),
+            advice,
+            service_note,
             network,
         }))
     }
@@ -378,6 +427,12 @@ type RtIndex = HashMap<(String, i64), RtObs>;
 struct RtObs {
     predicted_ms: Option<i64>,
     schedule_relationship: i64,
+}
+
+/// Formate des secondes depuis minuit (heure locale) en `HH:MM`.
+fn hhmm(secs: i64) -> String {
+    let s = secs.rem_euclid(86_400);
+    format!("{:02}:{:02}", s / 3600, (s % 3600) / 60)
 }
 
 /// Convertit un horaire GTFS (secondes depuis minuit, heure locale Bruxelles)

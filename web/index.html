@@ -8,35 +8,59 @@
     :root { --bg:#0f1115; --card:#1a1d24; --muted:#8b93a1; --fg:#e7eaf0; --accent:#3b82f6; }
     * { box-sizing: border-box; }
     body { margin:0; font:16px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
-    header { padding:24px 16px 8px; max-width:760px; margin:0 auto; }
+    header { padding:24px 16px 8px; max-width:820px; margin:0 auto; }
     h1 { margin:0 0 4px; font-size:1.4rem; }
     .sub { color:var(--muted); font-size:.9rem; }
-    main { max-width:760px; margin:0 auto; padding:16px; }
-    form { display:flex; gap:8px; margin:16px 0; }
+    main { max-width:820px; margin:0 auto; padding:16px; }
+    form { display:flex; gap:8px; margin:16px 0; flex-wrap:wrap; }
     input { flex:1; min-width:0; padding:12px 14px; border-radius:10px; border:1px solid #2a2f3a; background:var(--card); color:var(--fg); font-size:1rem; }
-    button { padding:12px 16px; border-radius:10px; border:0; background:var(--accent); color:#fff; font-size:1rem; cursor:pointer; white-space:nowrap; }
+    button { padding:10px 14px; border-radius:10px; border:0; background:var(--accent); color:#fff; font-size:.95rem; cursor:pointer; white-space:nowrap; }
     button.ghost { background:#2a2f3a; color:var(--fg); }
     button:disabled { opacity:.5; cursor:default; }
     .hint { color:var(--muted); font-size:.85rem; }
     .results { list-style:none; padding:0; margin:12px 0; }
-    .results li { background:var(--card); border-radius:10px; padding:10px 12px; margin:6px 0; cursor:pointer; display:flex; justify-content:space-between; gap:8px; align-items:center; }
-    .results li:hover { outline:1px solid var(--accent); }
-    .results .dist { color:var(--muted); font-size:.8rem; }
-    .stop { margin-top:20px; }
-    .stop h2 { font-size:1.1rem; margin:0 0 2px; }
-    .feed { display:flex; align-items:center; gap:8px; color:var(--muted); font-size:.8rem; margin-bottom:14px; }
+    .results li { background:var(--card); border-radius:10px; padding:10px 12px; margin:6px 0; display:flex; justify-content:space-between; gap:10px; align-items:center; }
+    .results .dist { color:var(--muted); font-size:.8rem; white-space:nowrap; }
+    .choice-main { min-width:0; }
+    .choice-name { font-weight:600; font-size:.95rem; }
+    .dirs { display:flex; flex-wrap:wrap; gap:6px; margin-top:4px; }
+    .dir { font-size:.78rem; padding:2px 8px; border-radius:999px; background:#232833; color:#cbd5e1; }
+    .dir.muted { color:var(--muted); font-style:italic; }
+    .choice-side { display:flex; align-items:center; gap:8px; flex-shrink:0; }
+    .maplink { font-size:.78rem; color:var(--accent); text-decoration:none; }
+    .maplink:hover { text-decoration:underline; }
+
+    /* Arrêts suivis */
+    .tracked { margin-top:24px; }
+    .tracked-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
+    .tracked-head h2 { font-size:1.05rem; margin:0; }
+    .stop { background:var(--card); border-radius:12px; padding:14px; margin:12px 0; border-left:5px solid var(--muted); }
+    .stop-head { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+    .role { font-size:.8rem; font-weight:700; padding:3px 10px; border-radius:999px; background:#1e2430; color:#93c5fd; }
+    .role-input { font-size:.8rem; padding:3px 8px; border-radius:8px; border:1px solid #2a2f3a; background:#12151b; color:var(--fg); width:auto; }
+    .stop-title { font-weight:700; font-size:1rem; margin-left:2px; }
+    .stop-actions { margin-left:auto; display:flex; gap:6px; }
+    .icon-btn { background:#2a2f3a; color:var(--fg); padding:5px 10px; font-size:.8rem; border-radius:8px; }
+    .icon-btn.danger { color:#fca5a5; }
+    .feed { display:flex; align-items:center; gap:8px; color:var(--muted); font-size:.8rem; margin:6px 0 10px; }
     .dot { width:8px; height:8px; border-radius:50%; background:#22c55e; animation:pulse 2s infinite; }
     .dot.stale { background:#ef4444; animation:none; }
     @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
-    .line { background:var(--card); border-radius:12px; padding:14px; margin:10px 0; border-left:5px solid var(--muted); }
+    .line { background:var(--card); border-radius:10px; padding:12px; margin:8px 0; border-left:4px solid var(--muted); }
     .line-head { display:flex; align-items:center; gap:10px; }
     .badge { min-width:30px; height:30px; padding:0 6px; border-radius:8px; display:grid; place-items:center; font-weight:700; background:#2a2f3a; }
-    .line-name { font-weight:600; font-size:.95rem; }
-    .status { margin-left:auto; font-size:.85rem; padding:4px 10px; border-radius:999px; font-weight:600; }
-    .reason { color:var(--muted); font-size:.85rem; margin-top:6px; }
-    .basis { margin-top:8px; font-size:.85rem; color:#cbd5e1; }
+    .line-name { font-weight:600; font-size:.9rem; }
+    .status { margin-left:auto; font-size:.8rem; padding:3px 10px; border-radius:999px; font-weight:600; }
+    .basis { margin-top:8px; font-size:.82rem; color:#cbd5e1; }
+    .where { color:var(--muted); font-size:.8rem; margin:2px 0 6px; }
+    .where a { color:var(--accent); text-decoration:none; }
+    .where a:hover { text-decoration:underline; }
+    .served { margin-top:10px; }
+    .served-title { color:var(--muted); font-size:.82rem; margin-bottom:6px; }
+    .badges { display:flex; flex-wrap:wrap; gap:6px; }
+    .badges .badge { min-width:auto; padding:4px 10px; border-radius:8px; background:#2a2f3a; font-weight:700; }
     .evidence { list-style:none; padding:0; margin:6px 0 0; display:flex; flex-wrap:wrap; gap:6px; }
-    .evidence li { font-size:.78rem; padding:3px 9px; border-radius:999px; background:#232833; color:#cbd5e1; }
+    .evidence li { font-size:.76rem; padding:3px 9px; border-radius:999px; background:#232833; color:#cbd5e1; }
     .evidence li.ev-data_fresh { background:#14532d; color:#86efac; }
     .evidence li.ev-data_stale { background:#7f1d1d; color:#fca5a5; }
     .evidence li.ev-cancelled { background:#7c2d12; color:#fdba74; }
@@ -44,10 +68,10 @@
     .evidence li.ev-delay { background:#78350f; color:#fdba74; }
     .evidence li.ev-on_time { background:#14532d; color:#86efac; }
     .evidence li.ev-no_scheduled_service { background:#374151; color:#d1d5db; }
-    table { width:100%; border-collapse:collapse; margin-top:10px; font-size:.9rem; }
+    table { width:100%; border-collapse:collapse; margin-top:10px; font-size:.88rem; }
     th,td { text-align:left; padding:4px 6px; border-bottom:1px solid #232833; }
     th { color:var(--muted); font-weight:500; }
-    .advice { margin-top:16px; padding:12px 14px; border-radius:10px; background:#1e2430; font-weight:600; }
+    .advice { margin-top:12px; padding:10px 12px; border-radius:10px; background:#1e2430; font-weight:600; }
     .normal{background:#14532d;color:#86efac} .perturbed{background:#78350f;color:#fdba74}
     .reduced{background:#7c2d12;color:#fdba74} .stopped{background:#7f1d1d;color:#fca5a5}
     .unknown{background:#374151;color:#d1d5db}
@@ -56,6 +80,7 @@
     .s-unknown{border-left-color:#6b7280}
     .err { color:#fca5a5; }
     .flash { animation:flash 1s; } @keyframes flash { from{background:#1e2b3f} to{background:var(--card)} }
+    .empty { color:var(--muted); font-size:.9rem; padding:12px; text-align:center; }
   </style>
 </head>
 <body>
@@ -69,20 +94,65 @@
       <button>Chercher</button>
       <button type="button" id="geo" class="ghost" title="Utiliser ma position">Ma position</button>
     </form>
-    <div class="hint" id="hint">Tapez un arrêt ou utilisez votre position. Mise à jour automatique en direct.</div>
+    <div class="hint" id="hint">Cherchez un arrêt puis « Suivre ». Vous pouvez en suivre plusieurs (domicile, travail, aller/retour…).</div>
     <ul id="choices" class="results"></ul>
-    <div id="results"></div>
+
+    <section class="tracked">
+      <div class="tracked-head">
+        <h2 id="tracked-title">Mes arrêts suivis</h2>
+        <button type="button" id="share" class="ghost">Copier le lien</button>
+      </div>
+      <div id="results"></div>
+    </section>
   </main>
 
   <script>
     const LABEL = { normal:"Normal", perturbed:"Perturbé", reduced:"Réduit", stopped:"À l'arrêt", unknown:"Inconnu" };
     const fmt = iso => new Date(iso).toLocaleTimeString("fr-BE", { hour:"2-digit", minute:"2-digit" });
     const $ = id => document.getElementById(id);
+    const STORAGE_KEY = "transitpulse.stops";
 
-    let ws = null;
-    let currentStop = null;
+    // Modèle : arrêts suivis + leurs sockets.
+    let tracked = [];               // [{stop_id, name, role, lat, lon}]
+    const sockets = new Map();      // stop_id -> WebSocket
+    const latest = new Map();       // stop_id -> dernier StopStatus reçu
 
-    // --- Recherche d'arrêts (nom ou adresse) ---
+    // ---------- Persistance (localStorage + URL) ----------
+    function loadInitial() {
+      const params = new URLSearchParams(location.search);
+      const raw = params.get("stops");
+      if (raw) {
+        tracked = raw.split(",").map(parseEntry).filter(Boolean);
+      } else if (params.get("stop")) {
+        // Compat : ancienne URL mono-arrêt.
+        tracked = [{ stop_id: params.get("stop"), name: params.get("name") || params.get("stop"), role: "Arrêt" }];
+      } else {
+        try { tracked = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]"); } catch { tracked = []; }
+      }
+    }
+    function parseEntry(s) {
+      const i = s.indexOf(":");
+      if (i < 0) return null;
+      const stop_id = decodeURIComponent(s.slice(0, i));
+      const role = decodeURIComponent(s.slice(i + 1)) || "Arrêt";
+      // Le nom réel arrive avec le premier statut (WebSocket).
+      return { stop_id, name: "", role };
+    }
+    function save() {
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(tracked)); } catch {}
+      const url = new URL(location);
+      url.searchParams.delete("stop");
+      url.searchParams.delete("name");
+      if (tracked.length) {
+        url.searchParams.set("stops", tracked.map(t =>
+          `${encodeURIComponent(t.stop_id)}:${encodeURIComponent(t.role)}`).join(","));
+      } else {
+        url.searchParams.delete("stops");
+      }
+      history.replaceState(null, "", url);
+    }
+
+    // ---------- Recherche ----------
     $("search").addEventListener("submit", async (e) => {
       e.preventDefault();
       const q = $("q").value.trim();
@@ -90,21 +160,15 @@
       $("hint").textContent = "Recherche…";
       try {
         const res = await (await fetch(`/api/search?q=${encodeURIComponent(q)}`)).json();
-        if (res.origin) {
-          $("hint").textContent = `Adresse trouvée : ${res.origin.label}`;
-        }
-        if (res.note && !res.stops.length) {
-          $("choices").innerHTML = "";
-          $("hint").textContent = res.note;
-          return;
-        }
-        renderChoices(res.stops, { nearby: !!res.origin });
+        if (res.origin) $("hint").textContent = `Adresse trouvée : ${res.origin.label}`;
+        if (res.note && !res.stops.length) { $("choices").innerHTML = ""; $("hint").textContent = res.note; return; }
+        renderChoices(res.stops);
       } catch (err) { showError(err); }
     });
 
-    // --- Géolocalisation navigateur ---
+    // ---------- Géolocalisation ----------
     $("geo").addEventListener("click", () => {
-      if (!navigator.geolocation) { $("hint").textContent = "Géolocalisation non supportée par le navigateur."; return; }
+      if (!navigator.geolocation) { $("hint").textContent = "Géolocalisation non supportée."; return; }
       $("geo").disabled = true;
       $("hint").textContent = "Localisation en cours…";
       navigator.geolocation.getCurrentPosition(
@@ -113,8 +177,7 @@
           try {
             const stops = await (await fetch(`/api/nearby?lat=${lat}&lon=${lon}&radius=800`)).json();
             renderChoices(stops, { nearby: true });
-            if (stops.length) selectStop(stops[0].stop_id, stops[0].name);
-            else $("hint").textContent = "Aucun arrêt dans un rayon de 800 m.";
+            $("hint").textContent = `${stops.length} arrêt(s) proches — choisissez.`;
           } catch (err) { showError(err); }
           finally { $("geo").disabled = false; }
         },
@@ -126,113 +189,200 @@
     function renderChoices(stops, opts = {}) {
       const ul = $("choices"); ul.innerHTML = "";
       if (!stops.length) { $("hint").textContent = "Aucun arrêt trouvé."; return; }
-      $("hint").textContent = `${stops.length} arrêt(s) — cliquez pour suivre en direct.`;
+      if (!opts.nearby) $("hint").textContent = `${stops.length} arrêt(s) — choisissez la bonne direction.`;
       for (const s of stops) {
         const li = document.createElement("li");
-        const dist = (s.metres != null) ? `<span class="dist">${Math.round(s.metres)} m</span>`
-                    : (opts.nearby ? "" : "");
-        li.innerHTML = `<span>${escapeHtml(s.name)}</span>${dist}`;
-        li.addEventListener("click", () => selectStop(s.stop_id, s.name));
+        const dirs = (s.directions || [])
+          .map(d => `<span class="dir">${escapeHtml(d.short_name)}&nbsp;→&nbsp;${escapeHtml(d.headsign.trim())}</span>`)
+          .join("");
+        const dist = (s.metres != null && s.metres > 0) ? `<span class="dist">${Math.round(s.metres)} m</span>` : "";
+        const map = `https://www.openstreetmap.org/?mlat=${s.lat}&mlon=${s.lon}#map=19/${s.lat}/${s.lon}`;
+        li.innerHTML = `
+          <div class="choice-main">
+            <div class="choice-name">${escapeHtml(s.name)}</div>
+            <div class="dirs">${dirs || '<span class="dir muted">desserte inconnue</span>'}</div>
+          </div>
+          <div class="choice-side">
+            ${dist}
+            <a class="maplink" href="${map}" target="_blank" rel="noopener" onclick="event.stopPropagation()">carte</a>
+            <button class="follow">Suivre</button>
+          </div>`;
+        li.querySelector(".follow").addEventListener("click", (e) => { e.stopPropagation(); follow(s); });
         ul.appendChild(li);
       }
     }
 
-    // --- Sélection d'un arrêt + WebSocket live ---
-    function selectStop(stopId, name) {
-      currentStop = stopId;
-      $("choices").innerHTML = "";
-      $("hint").textContent = `Suivi en direct : ${name}`;
-      // Arrêt partageable : on le reflète dans l'URL.
-      const url = new URL(location);
-      url.searchParams.set("stop", stopId);
-      if (name) url.searchParams.set("name", name);
-      history.replaceState(null, "", url);
-      document.title = name ? `${name} — TransitPulse` : "TransitPulse";
-      connectLive(stopId);
+    // ---------- Suivi d'un arrêt ----------
+    function follow(s, role) {
+      if (tracked.some(t => t.stop_id === s.stop_id)) { flashStop(s.stop_id); return; }
+      tracked.push({ stop_id: s.stop_id, name: s.name, role: role || defaultRole(), lat: s.lat, lon: s.lon });
+      save();
+      renderTracked();
+      connect(s.stop_id);
+      const card = document.querySelector(`[data-stop="${CSS.escape(s.stop_id)}"]`);
+      if (card) card.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+    function defaultRole() {
+      const used = new Set(tracked.map(t => t.role));
+      const prefs = ["Domicile", "Travail", "Embarquement", "Débarquement", "Aller", "Retour"];
+      return prefs.find(p => !used.has(p)) || "Arrêt";
+    }
+    function remove(stop_id) {
+      tracked = tracked.filter(t => t.stop_id !== stop_id);
+      const ws = sockets.get(stop_id); if (ws) { ws.onclose = null; ws.close(); sockets.delete(stop_id); }
+      latest.delete(stop_id);
+      save();
+      renderTracked();
+    }
+    function setRole(stop_id, role) {
+      const t = tracked.find(t => t.stop_id === stop_id);
+      if (t) { t.role = role || "Arrêt"; save(); renderTracked(); }
     }
 
-    // Au chargement : si l'URL porte un arrêt, on le suit directement.
-    (function initFromUrl() {
-      const params = new URLSearchParams(location.search);
-      const stop = params.get("stop");
-      const name = params.get("name") || stop;
-      if (stop) {
-        $("hint").textContent = `Suivi en direct : ${name}`;
-        selectStop(stop, name);
+    // ---------- Rendu de la liste suivie ----------
+    function renderTracked() {
+      $("tracked-title").textContent = tracked.length
+        ? `Mes arrêts suivis (${tracked.length})` : "Mes arrêts suivis";
+      const box = $("results");
+      box.innerHTML = "";
+      if (!tracked.length) {
+        box.innerHTML = '<div class="empty">Aucun arrêt suivi. Cherchez un arrêt ou utilisez « Ma position ».</div>';
+        return;
       }
-    })();
+      for (const t of tracked) {
+        const card = document.createElement("div");
+        card.className = "stop";
+        card.dataset.stop = t.stop_id;
+        card.innerHTML = `
+          <div class="stop-head">
+            <span class="role" hidden></span>
+            <input class="role-input" value="${escapeAttr(t.role)}" title="Nommez ce point (Domicile, Travail…)">
+            <span class="stop-title">${escapeHtml(t.name || t.stop_id)}</span>
+            <div class="stop-actions">
+              <button class="icon-btn danger" title="Ne plus suivre">Retirer</button>
+            </div>
+          </div>
+          <div class="body"></div>`;
+        const input = card.querySelector(".role-input");
+        input.addEventListener("change", () => setRole(t.stop_id, input.value));
+        input.addEventListener("click", e => e.stopPropagation());
+        card.querySelector(".danger").addEventListener("click", () => remove(t.stop_id));
+        box.appendChild(card);
+        if (latest.has(t.stop_id)) renderStatus(t.stop_id, latest.get(t.stop_id));
+      }
+    }
 
-    function connectLive(stopId) {
-      if (ws) { ws.onclose = null; ws.close(); }
+    // ---------- WebSocket par arrêt ----------
+    function connect(stop_id) {
+      if (sockets.has(stop_id)) return;
       const proto = location.protocol === "https:" ? "wss" : "ws";
-      ws = new WebSocket(`${proto}://${location.host}/api/live?stop=${encodeURIComponent(stopId)}`);
+      const ws = new WebSocket(`${proto}://${location.host}/api/live?stop=${encodeURIComponent(stop_id)}`);
+      sockets.set(stop_id, ws);
       ws.onmessage = (ev) => {
         const msg = JSON.parse(ev.data);
-        if (msg.type === "status") renderStop(msg.status);
-        else if (msg.type === "error") showError(new Error(msg.message));
+        if (msg.type === "status") { latest.set(stop_id, msg.status); renderStatus(stop_id, msg.status); }
+        else if (msg.type === "error") setCardError(stop_id, msg.message);
       };
-      ws.onerror = () => showError(new Error("Connexion temps réel interrompue."));
-      ws.onclose = () => { /* reconnexion gérée au prochain selectStop */ };
+      ws.onerror = () => setCardError(stop_id, "Connexion temps réel interrompue.");
+      ws.onclose = () => {
+        sockets.delete(stop_id);
+        // Reconnexion douce si l'arrêt est toujours suivi.
+        if (tracked.some(t => t.stop_id === stop_id)) setTimeout(() => connect(stop_id), 3000);
+      };
     }
 
-    function renderStop(st) {
-      if (currentStop && st.stop.stop_id !== currentStop) return;
-      const box = $("results");
-      const fresh = st.feed_age_secs != null && st.feed_age_secs < 120;
-      const maj = st.last_updated
-        ? `il y a ${st.feed_age_secs ?? "?"} s (${fmt(st.last_updated)})`
-        : "mise à jour inconnue";
-      box.innerHTML = "";
-      const el = document.createElement("div");
-      el.className = "stop";
-      el.innerHTML = `<h2>${escapeHtml(st.stop.name)}</h2>
-        <div class="feed"><span class="dot ${fresh ? "" : "stale"}"></span>${maj}</div>`;
-      for (const l of st.lines) {
-        const rows = l.departures.map(d => {
-          const obs = d.cancelled ? "annulé" : (d.observed ? fmt(d.observed) : "—");
-          let deltaTxt = "—";
-          if (!d.cancelled && d.observed) {
-            const delta = Math.round((new Date(d.observed) - new Date(d.scheduled)) / 60000);
-            deltaTxt = delta > 0 ? `+${delta} min` : (delta < 0 ? `${delta} min` : "à l'heure");
-          }
-          return `<tr><td>${l.line.short_name}</td><td>${escapeHtml(d.headsign)}</td>
-                  <td>${fmt(d.scheduled)}</td><td>${obs}</td><td>${deltaTxt}</td></tr>`;
-        }).join("");
-        const div = document.createElement("div");
-        div.className = `line s-${l.status}`;
-        div.innerHTML = `
-          <div class="line-head">
-            <div class="badge">${escapeHtml(l.line.short_name)}</div>
-            <div class="line-name">${escapeHtml(l.line.long_name)}</div>
-            <span class="status ${l.status}">${LABEL[l.status]}</span>
-          </div>
-          ${l.reason ? `<div class="reason">${escapeHtml(l.reason)}</div>` : ""}
-          <div class="basis">Pourquoi&nbsp;: ${escapeHtml(l.basis || "—")}</div>
-          ${(l.evidence && l.evidence.length)
-            ? `<ul class="evidence">${l.evidence.map(e => `<li class="ev-${e.kind}">${escapeHtml(e.detail)}</li>`).join("")}</ul>`
-            : ""}
-          <table>
-            <thead><tr><th>Ligne</th><th>Direction</th><th>Prévu</th><th>Observé</th><th>Écart</th></tr></thead>
-            <tbody>${rows}</tbody>
-          </table>`;
-        el.appendChild(div);
+    function renderStatus(stop_id, st) {
+      const card = document.querySelector(`[data-stop="${CSS.escape(stop_id)}"]`);
+      if (!card) return;
+      // Renseigne le nom d'arrêt s'il n'est pas encore connu (arrivée par URL).
+      const t = tracked.find(x => x.stop_id === stop_id);
+      if (t && st.stop?.name) {
+        t.name = st.stop.name;
+        t.lat = st.stop.lat;
+        t.lon = st.stop.lon;
+        const title = card.querySelector(".stop-title");
+        if (title) title.textContent = t.name;
       }
-      const advice = document.createElement("div");
-      advice.className = "advice";
-      advice.textContent = st.advice;
-      el.appendChild(advice);
-      box.appendChild(el);
-      // Petit flash à chaque mise à jour.
-      el.classList.add("flash");
-      setTimeout(() => el.classList.remove("flash"), 1000);
+      const body = card.querySelector(".body");
+      const fresh = st.feed_age_secs != null && st.feed_age_secs < 120;
+      const maj = st.last_updated ? `il y a ${st.feed_age_secs ?? "?"} s` : "maj inconnue";
+      const mapUrl = `https://www.openstreetmap.org/?mlat=${st.stop.lat}&mlon=${st.stop.lon}#map=18/${st.stop.lat}/${st.stop.lon}`;
+      card.className = "stop s-" + worstStatus(st);
+      let html = `<div class="where">${st.stop.lat.toFixed(5)}, ${st.stop.lon.toFixed(5)} — <a href="${mapUrl}" target="_blank" rel="noopener">carte</a></div>
+        <div class="feed"><span class="dot ${fresh ? "" : "stale"}"></span>${maj}</div>`;
+
+      if (!st.lines.length) {
+        html += `<div class="advice">${escapeHtml(st.service_note || st.advice || "Aucun passage prévu dans l'heure.")}</div>`;
+        if (st.served_lines && st.served_lines.length) {
+          html += `<div class="served"><div class="served-title">Lignes desservant cet arrêt&nbsp;:</div>
+            <div class="badges">${st.served_lines.map(l =>
+              `<span class="badge" title="${escapeAttr(l.long_name)}">${escapeHtml(l.short_name)}</span>`).join("")}</div></div>`;
+        }
+      } else {
+        for (const l of st.lines) {
+          const rows = l.departures.map(d => {
+            const obs = d.cancelled ? "annulé" : (d.observed ? fmt(d.observed) : "—");
+            let deltaTxt = "—";
+            if (!d.cancelled && d.observed) {
+              const delta = Math.round((new Date(d.observed) - new Date(d.scheduled)) / 60000);
+              deltaTxt = delta > 0 ? `+${delta} min` : (delta < 0 ? `${delta} min` : "à l'heure");
+            }
+            return `<tr><td>${l.line.short_name}</td><td>${escapeHtml(d.headsign)}</td>
+                    <td>${fmt(d.scheduled)}</td><td>${obs}</td><td>${deltaTxt}</td></tr>`;
+          }).join("");
+          html += `<div class="line s-${l.status}">
+            <div class="line-head">
+              <div class="badge">${escapeHtml(l.line.short_name)}</div>
+              <div class="line-name">${escapeHtml(l.line.long_name)}</div>
+              <span class="status ${l.status}">${LABEL[l.status]}</span>
+            </div>
+            <div class="basis">Pourquoi&nbsp;: ${escapeHtml(l.basis || "—")}</div>
+            ${(l.evidence && l.evidence.length)
+              ? `<ul class="evidence">${l.evidence.map(e => `<li class="ev-${e.kind}">${escapeHtml(e.detail)}</li>`).join("")}</ul>`
+              : ""}
+            <table><thead><tr><th>Ligne</th><th>Direction</th><th>Prévu</th><th>Observé</th><th>Écart</th></tr></thead>
+            <tbody>${rows}</tbody></table></div>`;
+        }
+        html += `<div class="advice">${escapeHtml(st.advice)}</div>`;
+      }
+      body.innerHTML = html;
+      body.classList.add("flash");
+      setTimeout(() => body.classList.remove("flash"), 1000);
     }
 
-    function showError(err) {
-      $("results").innerHTML = `<p class="err">Erreur : ${escapeHtml(err.message)}</p>`;
+    function worstStatus(st) {
+      const order = { stopped:0, reduced:1, perturbed:2, unknown:3, normal:4 };
+      if (!st.lines.length) return "unknown";
+      return st.lines.map(l => l.status).sort((a,b) => order[a]-order[b])[0];
     }
+    function setCardError(stop_id, msg) {
+      const card = document.querySelector(`[data-stop="${CSS.escape(stop_id)}"] .body`);
+      if (card) card.innerHTML = `<p class="err">${escapeHtml(msg)}</p>`;
+    }
+    function flashStop(stop_id) {
+      const card = document.querySelector(`[data-stop="${CSS.escape(stop_id)}"]`);
+      if (card) card.scrollIntoView({ behavior:"smooth", block:"center" });
+    }
+
+    // ---------- Lien partageable ----------
+    $("share").addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(location.href);
+        $("share").textContent = "Lien copié !";
+      } catch { $("share").textContent = location.href; }
+      setTimeout(() => { $("share").textContent = "Copier le lien"; }, 1500);
+    });
+
+    function showError(err) { $("hint").innerHTML = `<span class="err">Erreur : ${escapeHtml(err.message)}</span>`; }
     function escapeHtml(s) {
       return String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
     }
+    function escapeAttr(s) { return escapeHtml(s); }
+
+    // ---------- Init ----------
+    loadInitial();
+    renderTracked();
+    for (const t of tracked) connect(t.stop_id);
   </script>
 </body>
 </html>

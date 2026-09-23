@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::domain::{Line, Stop, TransportMode};
 
@@ -625,6 +625,52 @@ impl GtfsRepo {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Premier et dernier passage de la journée (secondes depuis minuit) à un
+    /// arrêt, pour les services actifs. `None` si l'arrêt n'est pas desservi.
+    pub fn day_extent(
+        &self,
+        stop_ids: &[String],
+        services: &[String],
+    ) -> Result<Option<(i64, i64)>> {
+        if stop_ids.is_empty() || services.is_empty() {
+            return Ok(None);
+        }
+        let stop_ph = (0..stop_ids.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let svc_ph = (0..services.len())
+            .map(|i| format!("?{}", i + 1 + stop_ids.len()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT MIN(st.departure_secs), MAX(st.departure_secs)
+             FROM gtfs_stop_times st
+             JOIN gtfs_trips t ON t.trip_id = st.trip_id
+             WHERE st.stop_id IN ({stop_ph})
+               AND st.departure_secs IS NOT NULL
+               AND t.service_id IN ({svc_ph})"
+        );
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        for s in stop_ids {
+            binds.push(Box::new(s.clone()));
+        }
+        for s in services {
+            binds.push(Box::new(s.clone()));
+        }
+        let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+        let row = self
+            .conn
+            .query_row(&sql, refs.as_slice(), |r| {
+                Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?))
+            })
+            .optional()?;
+        Ok(row.and_then(|(a, b)| match (a, b) {
+            (Some(a), Some(b)) => Some((a, b)),
+            _ => None,
+        }))
+    }
+
     /// Indique si un arrêt est effectivement desservi (au moins une course).
     pub fn stop_is_served(&self, stop_id: &str) -> Result<bool> {
         let n: i64 = self.conn.query_row(
@@ -710,6 +756,53 @@ impl GtfsRepo {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Sens de passage à un arrêt : ligne + destination (headsign) distincts.
+    /// Sert à distinguer deux quais de même nom (sens opposés).
+    pub fn directions_for_stop(&self, stop_id: &str, limit: usize) -> Result<Vec<Direction>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT r.short_name, t.headsign, r.route_type
+             FROM gtfs_stop_times st
+             JOIN gtfs_trips t ON t.trip_id = st.trip_id
+             JOIN gtfs_routes r ON r.route_id = t.route_id
+             WHERE st.stop_id = ?1
+             ORDER BY r.short_name, t.headsign
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![stop_id, limit as i64], |r| {
+            let rt: i64 = r.get(2)?;
+            Ok(Direction {
+                short_name: r.get(0)?,
+                headsign: r.get(1)?,
+                mode: route_type_to_mode(rt),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Enrichit une liste d'arrêts proches avec leurs destinations, en
+    /// écartant les arrêts non desservis (ex. stations parentes vides).
+    pub fn to_choices(
+        &self,
+        nearby: Vec<NearbyStop>,
+        keep_unserved: bool,
+    ) -> Result<Vec<StopChoice>> {
+        let mut out = Vec::new();
+        for n in nearby {
+            let directions = self.directions_for_stop(&n.stop.stop_id, 6)?;
+            let served = n.served && !directions.is_empty();
+            if !served && !keep_unserved {
+                continue;
+            }
+            out.push(StopChoice {
+                stop: n.stop,
+                metres: n.metres,
+                served,
+                directions,
+            });
+        }
+        Ok(out)
+    }
+
     /// Prochains passages prévus à un arrêt dans `[from_secs, from_secs + horizon]`
     /// (secondes depuis minuit du jour de service), **uniquement les services
     /// actifs** (`services`). Sans filtre, on mélangerait samedi, dimanche, vacances…
@@ -771,6 +864,26 @@ pub struct NearbyStop {
     pub stop: Stop,
     pub metres: f64,
     pub served: bool,
+}
+
+/// Un sens de passage à un arrêt : ligne + destination affichée.
+/// Permet de distinguer deux quais de même nom (sens opposés de la ligne).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Direction {
+    pub short_name: String,
+    pub headsign: String,
+    pub mode: TransportMode,
+}
+
+/// Un arrêt proposé à l'usager : nom, position, distance, et **destinations**
+/// des lignes qui le desservent (pour choisir le bon quai).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StopChoice {
+    #[serde(flatten)]
+    pub stop: Stop,
+    pub metres: f64,
+    pub served: bool,
+    pub directions: Vec<Direction>,
 }
 
 impl From<Stop> for NearbyStop {

@@ -236,6 +236,8 @@ fn build_stop_status(
         last_updated,
         feed_age_secs,
         advice: domain::advice(worst).to_string(),
+        served_lines: Vec::new(),
+        service_note: None,
         network: None,
     }
 }
