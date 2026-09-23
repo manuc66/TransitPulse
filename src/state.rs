@@ -234,9 +234,13 @@ fn build_stop_status(
         stop,
         lines,
         last_updated,
+        feed_timestamp: last_updated,
+        captured_at: None,
         feed_age_secs,
+        refresh_age_secs: None,
         advice: domain::advice(worst).to_string(),
         served_lines: Vec::new(),
+        directions: Vec::new(),
         service_note: None,
         network: None,
     }

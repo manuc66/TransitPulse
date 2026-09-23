@@ -39,10 +39,13 @@
     .role { font-size:.8rem; font-weight:700; padding:3px 10px; border-radius:999px; background:#1e2430; color:#93c5fd; }
     .role-input { font-size:.8rem; padding:3px 8px; border-radius:8px; border:1px solid #2a2f3a; background:#12151b; color:var(--fg); width:auto; }
     .stop-title { font-weight:700; font-size:1rem; margin-left:2px; }
+    .stop-dirs { margin:6px 0 2px; }
+    .stop-dirs:empty { display:none; }
     .stop-actions { margin-left:auto; display:flex; gap:6px; }
     .icon-btn { background:#2a2f3a; color:var(--fg); padding:5px 10px; font-size:.8rem; border-radius:8px; }
     .icon-btn.danger { color:#fca5a5; }
     .feed { display:flex; align-items:center; gap:8px; color:var(--muted); font-size:.8rem; margin:6px 0 10px; }
+    .feed-times { display:flex; flex-direction:column; line-height:1.35; }
     .dot { width:8px; height:8px; border-radius:50%; background:#22c55e; animation:pulse 2s infinite; }
     .dot.stale { background:#ef4444; animation:none; }
     @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
@@ -81,6 +84,24 @@
     .err { color:#fca5a5; }
     .flash { animation:flash 1s; } @keyframes flash { from{background:#1e2b3f} to{background:var(--card)} }
     .empty { color:var(--muted); font-size:.9rem; padding:12px; text-align:center; }
+    /* Résumé global */
+    .summary { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:10px 0 4px; }
+    .summary .pill { font-size:.82rem; font-weight:700; padding:4px 12px; border-radius:999px; background:#232833; color:#cbd5e1; }
+    .summary .pill.ok { background:#14532d; color:#86efac; }
+    .summary .pill.warn { background:#78350f; color:#fdba74; }
+    .summary .pill.bad { background:#7f1d1d; color:#fca5a5; }
+    .summary .pill.muted { background:#374151; color:#d1d5db; }
+    .stop.sorted-first { }
+    .next { display:inline-flex; align-items:baseline; gap:6px; margin:2px 0 8px; }
+    .next .n { font-size:1.5rem; font-weight:800; }
+    .next .unit { color:var(--muted); font-size:.9rem; }
+    @media (max-width:520px) {
+      header, main { padding-left:12px; padding-right:12px; }
+      .choice-side .follow { padding:8px 12px; }
+      .stop-title { width:100%; }
+      .stop-actions { margin-left:0; }
+      .next .n { font-size:1.3rem; }
+    }
   </style>
 </head>
 <body>
@@ -102,18 +123,20 @@
         <h2 id="tracked-title">Mes arrêts suivis</h2>
         <button type="button" id="share" class="ghost">Copier le lien</button>
       </div>
-      <div id="results"></div>
+      <div id="summary" class="summary" aria-live="polite"></div>
+      <div id="results" aria-live="polite"></div>
     </section>
   </main>
 
   <script>
     const LABEL = { normal:"Normal", perturbed:"Perturbé", reduced:"Réduit", stopped:"À l'arrêt", unknown:"Inconnu" };
+    const RANK = { stopped:0, reduced:1, perturbed:2, unknown:3, normal:4 };
     const fmt = iso => new Date(iso).toLocaleTimeString("fr-BE", { hour:"2-digit", minute:"2-digit" });
     const $ = id => document.getElementById(id);
     const STORAGE_KEY = "transitpulse.stops";
 
     // Modèle : arrêts suivis + leurs sockets.
-    let tracked = [];               // [{stop_id, name, role, lat, lon}]
+    let tracked = [];               // [{stop_id, name, role, lat, lon, directions}]
     const sockets = new Map();      // stop_id -> WebSocket
     const latest = new Map();       // stop_id -> dernier StopStatus reçu
 
@@ -124,31 +147,28 @@
       if (raw) {
         tracked = raw.split(",").map(parseEntry).filter(Boolean);
       } else if (params.get("stop")) {
-        // Compat : ancienne URL mono-arrêt.
-        tracked = [{ stop_id: params.get("stop"), name: params.get("name") || params.get("stop"), role: "Arrêt" }];
+        tracked = [{ stop_id: params.get("stop"), name: "", role: "Arrêt" }];
       } else {
         try { tracked = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]"); } catch { tracked = []; }
       }
+      // Retire toute clé inconnue (robustesse).
+      tracked = tracked.filter(t => t && t.stop_id);
     }
     function parseEntry(s) {
       const i = s.indexOf(":");
       if (i < 0) return null;
       const stop_id = decodeURIComponent(s.slice(0, i));
       const role = decodeURIComponent(s.slice(i + 1)) || "Arrêt";
-      // Le nom réel arrive avec le premier statut (WebSocket).
       return { stop_id, name: "", role };
     }
     function save() {
       try { localStorage.setItem(STORAGE_KEY, JSON.stringify(tracked)); } catch {}
       const url = new URL(location);
-      url.searchParams.delete("stop");
-      url.searchParams.delete("name");
+      url.searchParams.delete("stop"); url.searchParams.delete("name");
       if (tracked.length) {
         url.searchParams.set("stops", tracked.map(t =>
           `${encodeURIComponent(t.stop_id)}:${encodeURIComponent(t.role)}`).join(","));
-      } else {
-        url.searchParams.delete("stops");
-      }
+      } else { url.searchParams.delete("stops"); }
       history.replaceState(null, "", url);
     }
 
@@ -193,10 +213,11 @@
       for (const s of stops) {
         const li = document.createElement("li");
         const dirs = (s.directions || [])
-          .map(d => `<span class="dir">${escapeHtml(d.short_name)}&nbsp;→&nbsp;${escapeHtml(d.headsign.trim())}</span>`)
+          .map(d => `<span class="dir">${escapeHtml(d.short_name)}&nbsp;→&nbsp;${escapeHtml((d.headsign||"").trim())}</span>`)
           .join("");
         const dist = (s.metres != null && s.metres > 0) ? `<span class="dist">${Math.round(s.metres)} m</span>` : "";
         const map = `https://www.openstreetmap.org/?mlat=${s.lat}&mlon=${s.lon}#map=19/${s.lat}/${s.lon}`;
+        const isTracked = tracked.some(t => t.stop_id === s.stop_id);
         li.innerHTML = `
           <div class="choice-main">
             <div class="choice-name">${escapeHtml(s.name)}</div>
@@ -205,9 +226,9 @@
           <div class="choice-side">
             ${dist}
             <a class="maplink" href="${map}" target="_blank" rel="noopener" onclick="event.stopPropagation()">carte</a>
-            <button class="follow">Suivre</button>
+            <button class="follow" ${isTracked ? "disabled" : ""}>${isTracked ? "Suivi ✓" : "Suivre"}</button>
           </div>`;
-        li.querySelector(".follow").addEventListener("click", (e) => { e.stopPropagation(); follow(s); });
+        if (!isTracked) li.querySelector(".follow").addEventListener("click", (e) => { e.stopPropagation(); follow(s); });
         ul.appendChild(li);
       }
     }
@@ -215,12 +236,10 @@
     // ---------- Suivi d'un arrêt ----------
     function follow(s, role) {
       if (tracked.some(t => t.stop_id === s.stop_id)) { flashStop(s.stop_id); return; }
-      tracked.push({ stop_id: s.stop_id, name: s.name, role: role || defaultRole(), lat: s.lat, lon: s.lon });
-      save();
-      renderTracked();
-      connect(s.stop_id);
-      const card = document.querySelector(`[data-stop="${CSS.escape(s.stop_id)}"]`);
-      if (card) card.scrollIntoView({ behavior: "smooth", block: "center" });
+      const directions = (s.directions || []).map(d => ({ short_name: d.short_name, headsign: (d.headsign || "").trim() }));
+      tracked.push({ stop_id: s.stop_id, name: s.name, role: role || defaultRole(), lat: s.lat, lon: s.lon, directions });
+      save(); renderTracked(); connect(s.stop_id);
+      document.querySelector(`[data-stop="${CSS.escape(s.stop_id)}"]`)?.scrollIntoView({ behavior:"smooth", block:"center" });
     }
     function defaultRole() {
       const used = new Set(tracked.map(t => t.role));
@@ -230,9 +249,7 @@
     function remove(stop_id) {
       tracked = tracked.filter(t => t.stop_id !== stop_id);
       const ws = sockets.get(stop_id); if (ws) { ws.onclose = null; ws.close(); sockets.delete(stop_id); }
-      latest.delete(stop_id);
-      save();
-      renderTracked();
+      latest.delete(stop_id); save(); renderTracked();
     }
     function setRole(stop_id, role) {
       const t = tracked.find(t => t.stop_id === stop_id);
@@ -241,27 +258,25 @@
 
     // ---------- Rendu de la liste suivie ----------
     function renderTracked() {
-      $("tracked-title").textContent = tracked.length
-        ? `Mes arrêts suivis (${tracked.length})` : "Mes arrêts suivis";
-      const box = $("results");
-      box.innerHTML = "";
+      $("tracked-title").textContent = tracked.length ? `Mes arrêts suivis (${tracked.length})` : "Mes arrêts suivis";
+      const box = $("results"); box.innerHTML = "";
       if (!tracked.length) {
         box.innerHTML = '<div class="empty">Aucun arrêt suivi. Cherchez un arrêt ou utilisez « Ma position ».</div>';
+        $("summary").innerHTML = "";
         return;
       }
-      for (const t of tracked) {
+      // Tri par gravité : le plus préoccupant d'abord.
+      const ordered = [...tracked].sort((a, b) => severityOf(a.stop_id) - severityOf(b.stop_id));
+      for (const t of ordered) {
         const card = document.createElement("div");
-        card.className = "stop";
-        card.dataset.stop = t.stop_id;
+        card.className = "stop"; card.dataset.stop = t.stop_id;
         card.innerHTML = `
           <div class="stop-head">
-            <span class="role" hidden></span>
-            <input class="role-input" value="${escapeAttr(t.role)}" title="Nommez ce point (Domicile, Travail…)">
+            <input class="role-input" value="${escapeAttr(t.role)}" title="Nommez ce point (Domicile, Travail…)" aria-label="Nom du point suivi">
             <span class="stop-title">${escapeHtml(t.name || t.stop_id)}</span>
-            <div class="stop-actions">
-              <button class="icon-btn danger" title="Ne plus suivre">Retirer</button>
-            </div>
+            <div class="stop-actions"><button class="icon-btn danger" title="Ne plus suivre">Retirer</button></div>
           </div>
+          <div class="stop-dirs">${renderDirs(t.directions)}</div>
           <div class="body"></div>`;
         const input = card.querySelector(".role-input");
         input.addEventListener("change", () => setRole(t.stop_id, input.value));
@@ -270,6 +285,36 @@
         box.appendChild(card);
         if (latest.has(t.stop_id)) renderStatus(t.stop_id, latest.get(t.stop_id));
       }
+      renderSummary();
+    }
+
+    function severityOf(stop_id) {
+      const st = latest.get(stop_id);
+      if (!st) return 3;
+      if (!st.lines.length) return 3;
+      return Math.min(...st.lines.map(l => RANK[l.status] ?? 3));
+    }
+
+    function renderSummary() {
+      const counts = { stopped:0, perturbed:0, reduced:0, unknown:0, normal:0 };
+      for (const t of tracked) {
+        const st = latest.get(t.stop_id);
+        if (!st || !st.lines.length) { counts.unknown++; continue; }
+        counts[worstStatus(st)]++;
+      }
+      const pills = [];
+      if (counts.stopped) pills.push(`<span class="pill bad">${counts.stopped} à l'arrêt</span>`);
+      if (counts.reduced) pills.push(`<span class="pill bad">${counts.reduced} réduit(s)</span>`);
+      if (counts.perturbed) pills.push(`<span class="pill warn">${counts.perturbed} perturbé(s)</span>`);
+      if (counts.normal) pills.push(`<span class="pill ok">${counts.normal} normal(aux)</span>`);
+      if (counts.unknown) pills.push(`<span class="pill muted">${counts.unknown} sans donnée</span>`);
+      $("summary").innerHTML = pills.join("");
+    }
+
+    function renderDirs(dirs) {
+      if (!dirs || !dirs.length) return "";
+      return `<div class="dirs">${dirs.map(d =>
+        `<span class="dir">${escapeHtml(d.short_name)}&nbsp;→&nbsp;${escapeHtml(d.headsign)}</span>`).join("")}</div>`;
     }
 
     // ---------- WebSocket par arrêt ----------
@@ -280,13 +325,12 @@
       sockets.set(stop_id, ws);
       ws.onmessage = (ev) => {
         const msg = JSON.parse(ev.data);
-        if (msg.type === "status") { latest.set(stop_id, msg.status); renderStatus(stop_id, msg.status); }
+        if (msg.type === "status") { latest.set(stop_id, msg.status); renderStatus(stop_id, msg.status); renderSummary(); }
         else if (msg.type === "error") setCardError(stop_id, msg.message);
       };
       ws.onerror = () => setCardError(stop_id, "Connexion temps réel interrompue.");
       ws.onclose = () => {
         sockets.delete(stop_id);
-        // Reconnexion douce si l'arrêt est toujours suivi.
         if (tracked.some(t => t.stop_id === stop_id)) setTimeout(() => connect(stop_id), 3000);
       };
     }
@@ -294,22 +338,39 @@
     function renderStatus(stop_id, st) {
       const card = document.querySelector(`[data-stop="${CSS.escape(stop_id)}"]`);
       if (!card) return;
-      // Renseigne le nom d'arrêt s'il n'est pas encore connu (arrivée par URL).
       const t = tracked.find(x => x.stop_id === stop_id);
       if (t && st.stop?.name) {
-        t.name = st.stop.name;
-        t.lat = st.stop.lat;
-        t.lon = st.stop.lon;
+        t.name = st.stop.name; t.lat = st.stop.lat; t.lon = st.stop.lon;
         const title = card.querySelector(".stop-title");
         if (title) title.textContent = t.name;
       }
+      // Directions : depuis le statut si non connues (arrivée par URL).
+      if (t && (!t.directions || !t.directions.length) && st.directions?.length) {
+        t.directions = st.directions.map(d => ({ short_name: d.short_name, headsign: (d.headsign||"").trim() }));
+        const box = card.querySelector(".stop-dirs");
+        if (box) box.innerHTML = renderDirs(t.directions);
+      }
       const body = card.querySelector(".body");
       const fresh = st.feed_age_secs != null && st.feed_age_secs < 120;
-      const maj = st.last_updated ? `il y a ${st.feed_age_secs ?? "?"} s` : "maj inconnue";
+      const dataLine = st.feed_timestamp
+        ? `Donnée du&nbsp;: ${fmtClock(st.feed_timestamp)} (${fmtAge(st.feed_age_secs)})`
+        : "Donnée du&nbsp;: horodatage inconnu";
+      const verifiedLine = st.captured_at
+        ? `Vérifié à&nbsp;: ${fmtClock(st.captured_at)} (${fmtAge(st.refresh_age_secs)})`
+        : "Vérifié à&nbsp;: horodatage inconnu";
       const mapUrl = `https://www.openstreetmap.org/?mlat=${st.stop.lat}&mlon=${st.stop.lon}#map=18/${st.stop.lat}/${st.stop.lon}`;
       card.className = "stop s-" + worstStatus(st);
       let html = `<div class="where">${st.stop.lat.toFixed(5)}, ${st.stop.lon.toFixed(5)} — <a href="${mapUrl}" target="_blank" rel="noopener">carte</a></div>
-        <div class="feed"><span class="dot ${fresh ? "" : "stale"}"></span>${maj}</div>`;
+        <div class="feed"><span class="dot ${fresh ? "" : "stale"}"></span>
+          <div class="feed-times"><div>${dataLine}</div><div>${verifiedLine}</div></div>
+        </div>`;
+
+      // Prochain passage : le décompte qui répond à « je pars quand ? ».
+      const next = nextDeparture(st);
+      if (next) {
+        html += `<div class="next"><span class="n">${next.mins <= 0 ? "à quai" : next.mins}</span>
+          <span class="unit">${next.mins <= 0 ? "" : "min"} · ${escapeHtml(next.line)} → ${escapeHtml(next.headsign)}${next.cancelled ? " (annulé)" : ""}</span></div>`;
+      }
 
       if (!st.lines.length) {
         html += `<div class="advice">${escapeHtml(st.service_note || st.advice || "Aucun passage prévu dans l'heure.")}</div>`;
@@ -338,8 +399,7 @@
             </div>
             <div class="basis">Pourquoi&nbsp;: ${escapeHtml(l.basis || "—")}</div>
             ${(l.evidence && l.evidence.length)
-              ? `<ul class="evidence">${l.evidence.map(e => `<li class="ev-${e.kind}">${escapeHtml(e.detail)}</li>`).join("")}</ul>`
-              : ""}
+              ? `<ul class="evidence">${l.evidence.map(e => `<li class="ev-${e.kind}">${escapeHtml(e.detail)}</li>`).join("")}</ul>` : ""}
             <table><thead><tr><th>Ligne</th><th>Direction</th><th>Prévu</th><th>Observé</th><th>Écart</th></tr></thead>
             <tbody>${rows}</tbody></table></div>`;
         }
@@ -350,34 +410,74 @@
       setTimeout(() => body.classList.remove("flash"), 1000);
     }
 
+    /// Prochain passage non annulé dans l'heure (toutes lignes).
+    function nextDeparture(st) {
+      let best = null;
+      for (const l of st.lines) {
+        for (const d of l.departures) {
+          if (d.cancelled) continue;
+          const when = new Date(d.observed || d.scheduled).getTime();
+          if (!best || when < best.when) {
+            best = { when, mins: Math.round((when - Date.now()) / 60000), line: l.line.short_name, headsign: d.headsign, cancelled: d.cancelled };
+          }
+        }
+      }
+      if (!best) {
+        // Tous annulés : on montre quand même le premier comme annulé.
+        for (const l of st.lines) for (const d of l.departures) {
+          const when = new Date(d.scheduled).getTime();
+          if (!best || when < best.when) best = { when, mins: Math.round((when - Date.now())/60000), line: l.line.short_name, headsign: d.headsign, cancelled: d.cancelled };
+        }
+      }
+      return best;
+    }
+
     function worstStatus(st) {
-      const order = { stopped:0, reduced:1, perturbed:2, unknown:3, normal:4 };
       if (!st.lines.length) return "unknown";
-      return st.lines.map(l => l.status).sort((a,b) => order[a]-order[b])[0];
+      return st.lines.map(l => l.status).sort((a, b) => RANK[a] - RANK[b])[0];
     }
     function setCardError(stop_id, msg) {
-      const card = document.querySelector(`[data-stop="${CSS.escape(stop_id)}"] .body`);
-      if (card) card.innerHTML = `<p class="err">${escapeHtml(msg)}</p>`;
+      const body = document.querySelector(`[data-stop="${CSS.escape(stop_id)}"] .body`);
+      if (body) body.innerHTML = `<p class="err">${escapeHtml(msg)}</p>`;
     }
     function flashStop(stop_id) {
-      const card = document.querySelector(`[data-stop="${CSS.escape(stop_id)}"]`);
-      if (card) card.scrollIntoView({ behavior:"smooth", block:"center" });
+      document.querySelector(`[data-stop="${CSS.escape(stop_id)}"]`)?.scrollIntoView({ behavior:"smooth", block:"center" });
     }
 
     // ---------- Lien partageable ----------
     $("share").addEventListener("click", async () => {
-      try {
-        await navigator.clipboard.writeText(location.href);
-        $("share").textContent = "Lien copié !";
-      } catch { $("share").textContent = location.href; }
+      try { await navigator.clipboard.writeText(location.href); $("share").textContent = "Lien copié !"; }
+      catch { $("share").textContent = "Copie impossible"; }
       setTimeout(() => { $("share").textContent = "Copier le lien"; }, 1500);
     });
 
+    // ---------- Utilitaires ----------
     function showError(err) { $("hint").innerHTML = `<span class="err">Erreur : ${escapeHtml(err.message)}</span>`; }
     function escapeHtml(s) {
       return String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
     }
     function escapeAttr(s) { return escapeHtml(s); }
+
+    // Âge lisible d'une donnée : « à l'instant », « il y a 2 min », « il y a 1 h 05 ».
+    function fmtAge(secs) {
+      if (secs == null) return "?";
+      const s = Math.max(0, Math.round(Number(secs)));
+      if (s < 45) return "à l'instant";
+      const min = Math.floor(s / 60);
+      if (min < 60) return `il y a ${Math.max(1, min)} min`;
+      const h = Math.floor(min / 60), m = min % 60;
+      return `il y a ${h} h ${String(m).padStart(2, "0")}`;
+    }
+
+    // Heure locale HH:MM à partir d'un ISO UTC.
+    function fmtClock(iso) {
+      const d = new Date(iso);
+      if (isNaN(d)) return "?";
+      return d.toLocaleTimeString("fr-BE", { hour: "2-digit", minute: "2-digit" });
+    }
+
+    // Recalcule les décomptes « dans X min » toutes les 30 s (sans attendre un push).
+    setInterval(() => { for (const id of latest.keys()) renderStatus(id, latest.get(id)); }, 30000);
 
     // ---------- Init ----------
     loadInitial();

@@ -123,8 +123,24 @@ pub struct StopStatus {
     /// Toutes les lignes qui desservent habituellement cet arrêt, même hors
     /// service (ex. « quelles lignes passent ici ? » à 23 h). Évite un écran vide.
     pub served_lines: Vec<Line>,
-    pub last_updated: Option<DateTime<Utc>>,
+    /// Sens de passage (ligne + destination), même hors service : permet de
+    /// distinguer deux quais de même nom et de savoir où l'on va.
+    pub directions: Vec<crate::gtfs::Direction>,
+    /// Heure à laquelle le flux officiel a produit sa dernière mise à jour
+    /// (timestamp du feed GTFS-RT). « Quelle est la fraîcheur de la donnée ? »
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feed_timestamp: Option<DateTime<Utc>>,
+    /// Heure à laquelle nous avons interrogé et archivé le flux.
+    /// « Quand a-t-on rafraîchi pour la dernière fois ? »
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub captured_at: Option<DateTime<Utc>>,
+    /// Âge de la donnée officielle (maintenant − `feed_timestamp`).
     pub feed_age_secs: Option<u64>,
+    /// Temps écoulé depuis notre dernier rafraîchissement (maintenant − `captured_at`).
+    pub refresh_age_secs: Option<u64>,
+    /// Compat : ancien champ conservé pour les clients existants.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_updated: Option<DateTime<Utc>>,
     pub advice: String,
     /// Précision temporelle quand aucune ligne n'a de passage imminent
     /// (ex. « service terminé, dernier passage à 20:12 »).

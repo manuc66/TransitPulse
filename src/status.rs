@@ -77,8 +77,12 @@ impl StatusService {
         let services = self.repo.active_services(&yyyymmdd)?;
 
         // Obs. RT fraîches indexées par (trip_id, stop_sequence).
-        let (rt, feed_age) = self.latest_rt_for_stop(stop_id, &services)?;
-        let rt_fresh = feed_age.map(|a| a <= self.stale_after).unwrap_or(false);
+        let snap = self.latest_rt_for_stop(stop_id, &services)?;
+        let rt = &snap.observations;
+        let rt_fresh = snap
+            .feed_age_secs()
+            .map(|a| a <= self.stale_after)
+            .unwrap_or(false);
 
         // Alertes actives : lignes entièrement à l'arrêt et courses annulées.
         let alerts = self.active_alerts_for_stop(stop_id)?;
@@ -159,6 +163,23 @@ impl StatusService {
         }
         served_lines.sort_by(|a, b| a.short_name.cmp(&b.short_name));
 
+        // Directions (ligne + destination), même hors service.
+        let mut directions = Vec::new();
+        for s in &stops {
+            for d in self.repo.directions_for_stop(&s.stop_id, 8)? {
+                if !directions.iter().any(|x: &crate::gtfs::Direction| {
+                    x.short_name == d.short_name && x.headsign == d.headsign
+                }) {
+                    directions.push(d);
+                }
+            }
+        }
+        directions.sort_by(|a, b| {
+            a.short_name
+                .cmp(&b.short_name)
+                .then(a.headsign.cmp(&b.headsign))
+        });
+
         // Précision temporelle : service terminé ? pas encore commencé ?
         let stop_ids: Vec<String> = stops.iter().map(|s| s.stop_id.clone()).collect();
         let extent = self.repo.day_extent(&stop_ids, &services)?;
@@ -200,33 +221,38 @@ impl StatusService {
         // Contexte systémique de la commune de l'arrêt.
         let network = self.network_context(&stop.name)?;
 
+        let feed_age = snap.feed_age_secs();
+        let refresh_age = snap.refresh_age_secs();
+        let feed_timestamp = snap.feed_timestamp();
         Ok(Some(StopStatus {
             stop,
             lines,
             served_lines,
-            last_updated: feed_age.map(|a| Utc::now() - chrono::Duration::seconds(a)),
+            directions,
+            feed_timestamp,
+            captured_at: snap.captured_datetime(),
             feed_age_secs: feed_age.map(|a| a.max(0) as u64),
+            refresh_age_secs: refresh_age.map(|a| a.max(0) as u64),
+            last_updated: feed_timestamp,
             advice,
             service_note,
             network,
         }))
     }
 
-    /// Dernières observations RT pour les `trip_id` desservant l'arrêt.
-    fn latest_rt_for_stop(
-        &self,
-        stop_id: &str,
-        services: &[String],
-    ) -> Result<(RtIndex, Option<i64>)> {
+    /// Dernières observations RT pour les `trip_id` desservant l'arrêt, avec
+    /// l'horodatage du feed officiel et celui de notre rafraîchissement.
+    fn latest_rt_for_stop(&self, stop_id: &str, services: &[String]) -> Result<RtSnapshot> {
         if services.is_empty() {
-            return Ok((HashMap::new(), None));
+            return RtSnapshot::from_archive(&self.archive);
         }
         let placeholders = (0..services.len())
             .map(|i| format!("?{}", i + 2))
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT o.trip_id, o.stop_sequence, o.predicted_ms, o.schedule_relationship, o.feed_ts
+            "SELECT o.trip_id, o.stop_sequence, o.predicted_ms, o.schedule_relationship,
+                    o.feed_ts, o.captured_at
              FROM main.rt_observations o
              JOIN gtfs.gtfs_trips t ON t.trip_id = o.trip_id
              JOIN gtfs.gtfs_stop_times st ON st.trip_id = o.trip_id AND st.stop_sequence = o.stop_sequence
@@ -242,11 +268,13 @@ impl StatusService {
 
         let mut map = HashMap::new();
         let mut feed_ts = None;
+        let mut captured_at = None;
         let mut rows = stmt.query(params_ref.as_slice())?;
         while let Some(r) = rows.next()? {
             let trip_id: String = r.get(0)?;
             let seq: i64 = r.get(1)?;
             feed_ts = Some(r.get::<_, i64>(4)?);
+            captured_at = Some(r.get::<_, i64>(5)?);
             map.insert(
                 (trip_id, seq),
                 RtObs {
@@ -256,19 +284,21 @@ impl StatusService {
             );
         }
 
-        // Âge du feed = maintenant - feed_ts observé.
-        let age = match feed_ts {
-            Some(ts) => Some((Utc::now().timestamp() - ts).max(0)),
-            None => self.latest_feed_age()?,
-        };
-        Ok((map, age))
-    }
-
-    fn latest_feed_age(&self) -> Result<Option<i64>> {
-        let ts: Option<i64> =
-            self.archive
-                .query_row("SELECT MAX(feed_ts) FROM rt_observations", [], |r| r.get(0))?;
-        Ok(ts.map(|t| (Utc::now().timestamp() - t).max(0)))
+        // Aucune observation pour cet arrêt : on retombe sur l'horodatage
+        // global du dernier feed (l'arrêt n'a simplement pas de passage imminent).
+        if feed_ts.is_none() {
+            let fallback = RtSnapshot::from_archive(&self.archive)?;
+            return Ok(RtSnapshot {
+                observations: map,
+                feed_ts: fallback.feed_ts,
+                captured_at: fallback.captured_at,
+            });
+        }
+        Ok(RtSnapshot {
+            observations: map,
+            feed_ts,
+            captured_at,
+        })
     }
 
     /// Alertes actives (dernier feed) concernant l'arrêt : routes entièrement
@@ -422,6 +452,54 @@ struct ActiveAlerts {
 
 /// Observations RT indexées par `(trip_id, stop_sequence)`.
 type RtIndex = HashMap<(String, i64), RtObs>;
+
+/// Photo du temps réel pour un arrêt : observations + horodatages précis.
+#[derive(Debug, Default)]
+struct RtSnapshot {
+    observations: RtIndex,
+    /// Timestamp du feed officiel (quand l'opérateur a produit la donnée).
+    feed_ts: Option<i64>,
+    /// Quand nous avons interrogé/archivé le flux.
+    captured_at: Option<i64>,
+}
+
+impl RtSnapshot {
+    /// Horodatage du dernier feed archivé, sans filtre d'arrêt.
+    fn from_archive(conn: &rusqlite::Connection) -> Result<Self> {
+        let row: Option<(Option<i64>, Option<i64>)> = conn
+            .query_row(
+                "SELECT MAX(feed_ts), MAX(captured_at) FROM main.rt_observations",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let (feed_ts, captured_at) = row.unwrap_or((None, None));
+        Ok(Self {
+            observations: HashMap::new(),
+            feed_ts,
+            captured_at,
+        })
+    }
+
+    /// Âge de la donnée officielle (maintenant − `feed_ts`).
+    fn feed_age_secs(&self) -> Option<i64> {
+        self.feed_ts.map(|t| (Utc::now().timestamp() - t).max(0))
+    }
+
+    /// Temps depuis notre dernier rafraîchissement (maintenant − `captured_at`).
+    fn refresh_age_secs(&self) -> Option<i64> {
+        self.captured_at
+            .map(|t| (Utc::now().timestamp() - t).max(0))
+    }
+
+    fn feed_timestamp(&self) -> Option<chrono::DateTime<Utc>> {
+        self.feed_ts.and_then(|t| Utc.timestamp_opt(t, 0).single())
+    }
+
+    fn captured_datetime(&self) -> Option<chrono::DateTime<Utc>> {
+        self.captured_at.and_then(|t| Utc.timestamp_opt(t, 0).single())
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct RtObs {
