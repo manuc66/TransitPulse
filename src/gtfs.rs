@@ -484,6 +484,42 @@ impl GtfsRepo {
         })
     }
 
+    /// Crée le schéma sur une connexion vide (tests).
+    #[cfg(test)]
+    fn init_schema(&self) -> Result<()> {
+        self.conn.execute_batch(SCHEMA)?;
+        Ok(())
+    }
+
+    /// Insère un arrêt et, si `served`, un service/trip/stop_time le desservant.
+    #[cfg(test)]
+    fn seed_stop(&self, stop_id: &str, name: &str, lat: f64, lon: f64, served: bool) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO gtfs_stops (stop_id, stop_name, lat, lon) VALUES (?1, ?2, ?3, ?4)",
+            params![stop_id, name, lat, lon],
+        )?;
+        if served {
+            let route_id = format!("r-{stop_id}");
+            let trip_id = format!("t-{stop_id}");
+            self.conn.execute(
+                "INSERT OR IGNORE INTO gtfs_routes (route_id, short_name, long_name, route_type)
+                 VALUES (?1, '1', 'Test', 3)",
+                params![route_id],
+            )?;
+            self.conn.execute(
+                "INSERT OR IGNORE INTO gtfs_trips (trip_id, route_id, service_id, headsign)
+                 VALUES (?1, ?2, 's1', 'Test')",
+                params![trip_id, route_id],
+            )?;
+            self.conn.execute(
+                "INSERT OR IGNORE INTO gtfs_stop_times (trip_id, stop_sequence, stop_id, departure_secs)
+                 VALUES (?1, 1, ?2, 3600)",
+                params![trip_id, stop_id],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Recherche d'arrêts par nom (sous-chaîne, insensible à la casse).
     ///
     /// Priorise les arrêts réellement desservis (`gtfs_stop_times`) ; les
@@ -510,35 +546,56 @@ impl GtfsRepo {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Arrêt le plus proche d'un point, dans un rayon donné (mètres).
-    pub fn nearest_stop(&self, lat: f64, lon: f64, radius_m: f64) -> Result<Option<Stop>> {
+    /// Arrêts à proximité d'un point, dans un rayon donné (mètres), triés par
+    /// distance croissante. Les arrêts réellement desservis passent en premier.
+    pub fn nearby_stops(&self, lat: f64, lon: f64, radius_m: f64) -> Result<Vec<NearbyStop>> {
         // Boîte englobante approx. pour limiter les lignes scannées.
         let dlat = radius_m / 111_320.0;
         let dlon = radius_m / (111_320.0 * lat.to_radians().cos().max(0.01));
         let mut stmt = self.conn.prepare(
-            "SELECT stop_id, stop_name, lat, lon FROM gtfs_stops
-             WHERE lat BETWEEN ?1 AND ?2 AND lon BETWEEN ?3 AND ?4",
+            "SELECT s.stop_id, s.stop_name, s.lat, s.lon,
+                    EXISTS(SELECT 1 FROM gtfs_stop_times st WHERE st.stop_id = s.stop_id) AS served
+             FROM gtfs_stops s
+             WHERE s.lat BETWEEN ?1 AND ?2 AND s.lon BETWEEN ?3 AND ?4",
         )?;
         let rows = stmt.query_map(
             params![lat - dlat, lat + dlat, lon - dlon, lon + dlon],
             |r| {
-                Ok(Stop {
-                    stop_id: r.get(0)?,
-                    name: r.get(1)?,
-                    lat: r.get(2)?,
-                    lon: r.get(3)?,
-                })
+                Ok((
+                    Stop {
+                        stop_id: r.get(0)?,
+                        name: r.get(1)?,
+                        lat: r.get(2)?,
+                        lon: r.get(3)?,
+                    },
+                    r.get::<_, i64>(4)? != 0,
+                ))
             },
         )?;
-        let mut best: Option<(Stop, f64)> = None;
-        for s in rows {
-            let s = s?;
-            let d = crate::geo::haversine_m(lat, lon, s.lat, s.lon);
-            if d <= radius_m && best.as_ref().map(|(_, bd)| d < *bd).unwrap_or(true) {
-                best = Some((s, d));
+        let mut out = Vec::new();
+        for row in rows {
+            let (stop, served) = row?;
+            let metres = crate::geo::haversine_m(lat, lon, stop.lat, stop.lon);
+            if metres <= radius_m {
+                out.push(NearbyStop {
+                    stop,
+                    metres,
+                    served,
+                });
             }
         }
-        Ok(best.map(|(s, _)| s))
+        out.sort_by_key(|n| (!n.served, n.metres as i64));
+        out.truncate(20);
+        Ok(out)
+    }
+
+    /// Arrêt le plus proche d'un point, dans un rayon donné (mètres).
+    pub fn nearest_stop(&self, lat: f64, lon: f64, radius_m: f64) -> Result<Option<Stop>> {
+        Ok(self
+            .nearby_stops(lat, lon, radius_m)?
+            .into_iter()
+            .next()
+            .map(|n| n.stop))
     }
 
     /// Quais desservis rattachés à une station parente (`parent_station`).
@@ -689,6 +746,15 @@ impl GtfsRepo {
     }
 }
 
+/// Arrêt à proximité, avec distance et desserte.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NearbyStop {
+    #[serde(flatten)]
+    pub stop: Stop,
+    pub metres: f64,
+    pub served: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ScheduledDeparture {
     pub trip_id: String,
@@ -756,5 +822,43 @@ mod tests {
         let rec = csv::StringRecord::from(vec!["a", "b"]);
         assert!(header_index(&rec, "zzz").is_err());
         assert_eq!(header_index(&rec, "a").unwrap(), 0);
+    }
+
+    #[test]
+    fn nearby_tri_par_distance_et_desserte() {
+        let repo = GtfsRepo::open_in_memory().unwrap();
+        repo.init_schema().unwrap();
+        // Arrêt proche mais non desservi, plus loin mais desservi.
+        repo.seed_stop(
+            "near_unserved",
+            "Proche non desservi",
+            50.6430,
+            5.5730,
+            false,
+        )
+        .unwrap();
+        repo.seed_stop("far_served", "Loin desservi", 50.6445, 5.5730, true)
+            .unwrap();
+
+        let got = repo.nearby_stops(50.6431, 5.5734, 1000.0).unwrap();
+        assert_eq!(got.len(), 2);
+        // Le desservi passe devant, malgré une distance plus grande.
+        assert_eq!(got[0].stop.stop_id, "far_served");
+        assert!(got[0].served);
+        assert!(!got[1].served);
+        // nearest_stop renvoie bien le premier (desservi).
+        let nearest = repo.nearest_stop(50.6431, 5.5734, 1000.0).unwrap().unwrap();
+        assert_eq!(nearest.stop_id, "far_served");
+    }
+
+    #[test]
+    fn nearby_respecte_le_rayon() {
+        let repo = GtfsRepo::open_in_memory().unwrap();
+        repo.init_schema().unwrap();
+        repo.seed_stop("a", "A", 50.6430, 5.5730, true).unwrap();
+        repo.seed_stop("b", "B", 50.7000, 5.7000, true).unwrap(); // loin
+        let got = repo.nearby_stops(50.6431, 5.5734, 500.0).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].stop.stop_id, "a");
     }
 }

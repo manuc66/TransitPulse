@@ -14,6 +14,8 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
 
+use tokio::sync::broadcast;
+
 use crate::archive::{AlertRecord, Archive, Observation};
 
 /// GTFS-RT `trip-update` officiel TEC (JSON).
@@ -391,6 +393,15 @@ pub struct RtState {
     pub last_error: Option<String>,
 }
 
+/// Événement diffusé à chaque cycle RT réussi : les abonnés (WebSocket) savent
+/// alors qu'il y a du nouveau et peuvent recalculer leur statut.
+#[derive(Debug, Clone, Copy)]
+pub struct LiveEvent {
+    pub feed_ts: i64,
+    pub observations: usize,
+    pub alerts: usize,
+}
+
 impl RtState {
     pub fn feed_age_secs(&self, now: i64) -> Option<i64> {
         self.last_success.map(|t| now - t)
@@ -471,6 +482,7 @@ pub async fn run(
     archive: Arc<Mutex<Archive>>,
     raw: RawArchive,
     state: Arc<RwLock<RtState>>,
+    events: broadcast::Sender<LiveEvent>,
     cfg: RtConfig,
 ) {
     let mut cycles: u64 = 0;
@@ -483,12 +495,20 @@ pub async fn run(
                     alerts = o.alerts,
                     "cycle RT archivé"
                 );
-                let mut s = state.write().expect("état RT empoisonné");
-                s.last_success = Some(chrono::Utc::now().timestamp());
-                s.last_feed_ts = Some(o.feed_ts);
-                s.observations_last = o.observations;
-                s.alerts_last = o.alerts;
-                s.last_error = None;
+                {
+                    let mut s = state.write().expect("état RT empoisonné");
+                    s.last_success = Some(chrono::Utc::now().timestamp());
+                    s.last_feed_ts = Some(o.feed_ts);
+                    s.observations_last = o.observations;
+                    s.alerts_last = o.alerts;
+                    s.last_error = None;
+                }
+                // Diffuse l'événement (ignoré s'il n'y a aucun abonné).
+                let _ = events.send(LiveEvent {
+                    feed_ts: o.feed_ts,
+                    observations: o.observations,
+                    alerts: o.alerts,
+                });
             }
             Err(e) => {
                 tracing::warn!(error = %e, "échec du cycle RT");

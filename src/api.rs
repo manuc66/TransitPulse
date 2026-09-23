@@ -4,17 +4,21 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{
+        Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
 use tower_http::services::ServeDir;
 
 use crate::domain::StopStatus;
 use crate::gtfs::GtfsRepo;
-use crate::realtime::RtState;
+use crate::realtime::{LiveEvent, RtState};
 use crate::state::Repo;
 use crate::status::StatusService;
 
@@ -28,6 +32,8 @@ pub struct AppState {
     /// Service de statut réel.
     pub status: Option<Arc<Mutex<StatusService>>>,
     pub rt: Arc<RwLock<RtState>>,
+    /// Flux d'événements RT pour les abonnés WebSocket.
+    pub events: broadcast::Sender<LiveEvent>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -35,7 +41,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/health", get(health))
         .route("/api/search", get(search))
         .route("/api/status", get(status))
+        .route("/api/nearby", get(nearby))
         .route("/api/freshness", get(freshness))
+        .route("/api/live", get(live))
         .fallback_service(ServeDir::new("web"))
         .with_state(state)
 }
@@ -77,11 +85,47 @@ async fn status(
     State(state): State<AppState>,
     Query(p): Query<StatusParams>,
 ) -> Result<Json<StopStatus>, ApiError> {
-    // Résolution de l'arrêt cible.
-    let stop_id = if let Some(id) = p.stop {
-        id
-    } else if let (Some(lat), Some(lon)) = (p.lat, p.lon) {
-        let radius = p.radius.unwrap_or(500.0);
+    let stop_id = resolve_stop_id(&state, p.stop, p.lat, p.lon, p.radius)?;
+    compute_status(&state, &stop_id).map(Json)
+}
+
+#[derive(Deserialize)]
+struct NearbyParams {
+    lat: f64,
+    lon: f64,
+    radius: Option<f64>,
+}
+
+/// Arrêts à proximité, triés par distance : alimente la géolocalisation navigateur.
+async fn nearby(
+    State(state): State<AppState>,
+    Query(p): Query<NearbyParams>,
+) -> Result<Json<Vec<crate::gtfs::NearbyStop>>, ApiError> {
+    let radius = p.radius.unwrap_or(800.0);
+    let Some(gtfs) = &state.gtfs else {
+        return Err(ApiError::Internal("GTFS non chargé".into()));
+    };
+    let stops = gtfs
+        .lock()
+        .expect("gtfs mutex")
+        .nearby_stops(p.lat, p.lon, radius)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(stops))
+}
+
+/// Résout l'arrêt cible depuis un `stop_id` ou des coordonnées.
+fn resolve_stop_id(
+    state: &AppState,
+    stop: Option<String>,
+    lat: Option<f64>,
+    lon: Option<f64>,
+    radius: Option<f64>,
+) -> Result<String, ApiError> {
+    if let Some(id) = stop {
+        return Ok(id);
+    }
+    if let (Some(lat), Some(lon)) = (lat, lon) {
+        let radius = radius.unwrap_or(500.0);
         let from_gtfs = state.gtfs.as_ref().and_then(|g| {
             g.lock()
                 .expect("gtfs mutex")
@@ -90,38 +134,125 @@ async fn status(
                 .flatten()
                 .map(|s| s.stop_id)
         });
-        from_gtfs
+        return from_gtfs
             .or_else(|| {
                 state
                     .repo
                     .nearest(lat, lon, radius)
                     .map(|s| s.stop_id.clone())
             })
-            .ok_or_else(|| ApiError::NotFound("Aucun arrêt à proximité".into()))?
-    } else {
-        return Err(ApiError::BadRequest(
-            "Fournir `stop` ou `lat` + `lon`".into(),
-        ));
-    };
+            .ok_or_else(|| ApiError::NotFound("Aucun arrêt à proximité".into()));
+    }
+    Err(ApiError::BadRequest(
+        "Fournir `stop` ou `lat` + `lon`".into(),
+    ))
+}
 
-    // Statut réel si le GTFS est chargé. Les horaires GTFS sont en heure de
-    // Bruxelles : on ne doit PAS utiliser l'heure locale système (souvent UTC).
+/// Calcule le statut d'un arrêt (réel si GTFS chargé, sinon jeu fictif).
+fn compute_status(state: &AppState, stop_id: &str) -> Result<StopStatus, ApiError> {
+    // Les horaires GTFS sont en heure de Bruxelles : on ne doit PAS utiliser
+    // l'heure locale système (souvent UTC).
     if let Some(svc) = &state.status {
         let now = StatusService::now_brussels();
-        let result = svc.lock().expect("status mutex").stop_status(&stop_id, now);
+        let result = svc.lock().expect("status mutex").stop_status(stop_id, now);
         return match result {
-            Ok(Some(st)) => Ok(Json(st)),
+            Ok(Some(st)) => Ok(st),
             Ok(None) => Err(ApiError::NotFound(format!("Arrêt inconnu : {stop_id}"))),
             Err(e) => Err(ApiError::Internal(e.to_string())),
         };
     }
-
-    // Repli sur le jeu fictif.
     state
         .repo
-        .status_for_stop(&stop_id)
-        .map(Json)
+        .status_for_stop(stop_id)
         .ok_or_else(|| ApiError::NotFound(format!("Arrêt inconnu : {stop_id}")))
+}
+
+/// WebSocket `/api/live?stop=<id>` : pousse le statut dès chaque cycle temps réel.
+async fn live(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Query(p): Query<StatusParams>,
+) -> Result<Response, ApiError> {
+    let stop_id = resolve_stop_id(&state, p.stop, p.lat, p.lon, p.radius)?;
+    Ok(ws.on_upgrade(move |socket| live_loop(socket, state, stop_id)))
+}
+
+async fn live_loop(mut socket: WebSocket, state: AppState, stop_id: String) {
+    let mut events = state.events.subscribe();
+    let mut current = stop_id;
+
+    // Envoi initial immédiat, avant le premier cycle.
+    if push_status(&mut socket, &state, &current).await.is_err() {
+        return;
+    }
+
+    loop {
+        tokio::select! {
+            evt = events.recv() => match evt {
+                // `Lagged` = on a raté des cycles : on renvoie quand même l'état
+                // courant, qui est toujours le plus récent.
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                    if push_status(&mut socket, &state, &current).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            incoming = socket.recv() => match incoming {
+                // Le client peut changer d'arrêt en renvoyant un `stop_id` brut.
+                Some(Ok(Message::Text(txt))) => {
+                    let new_id = txt.trim().to_string();
+                    if !new_id.is_empty() && new_id != current {
+                        current = new_id;
+                        if push_status(&mut socket, &state, &current).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None => break,
+                _ => {}
+            },
+        }
+    }
+}
+
+async fn push_status(socket: &mut WebSocket, state: &AppState, stop_id: &str) -> Result<(), ()> {
+    let msg = match compute_status(state, stop_id) {
+        Ok(status) => serde_json::to_string(&LiveMessage::Status {
+            stop_id: stop_id.to_string(),
+            status: Box::new(status),
+        }),
+        Err(ApiError::NotFound(m)) => Ok(serde_json::to_string(&LiveMessage::Error {
+            stop_id: stop_id.to_string(),
+            message: m,
+        })
+        .unwrap_or_default()),
+        Err(_) => Ok(serde_json::to_string(&LiveMessage::Error {
+            stop_id: stop_id.to_string(),
+            message: "Erreur interne".into(),
+        })
+        .unwrap_or_default()),
+    };
+    match msg {
+        Ok(text) => socket
+            .send(Message::Text(text.into()))
+            .await
+            .map_err(|_| ()),
+        Err(_) => Err(()),
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum LiveMessage {
+    Status {
+        stop_id: String,
+        status: Box<StopStatus>,
+    },
+    Error {
+        stop_id: String,
+        message: String,
+    },
 }
 
 #[derive(Serialize)]

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>TransitPulse</title>
   <style>
-    :root { --bg:#0f1115; --card:#1a1d24; --muted:#8b93a1; --fg:#e7eaf0; }
+    :root { --bg:#0f1115; --card:#1a1d24; --muted:#8b93a1; --fg:#e7eaf0; --accent:#3b82f6; }
     * { box-sizing: border-box; }
     body { margin:0; font:16px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
     header { padding:24px 16px 8px; max-width:760px; margin:0 auto; }
@@ -13,16 +13,25 @@
     .sub { color:var(--muted); font-size:.9rem; }
     main { max-width:760px; margin:0 auto; padding:16px; }
     form { display:flex; gap:8px; margin:16px 0; }
-    input { flex:1; padding:12px 14px; border-radius:10px; border:1px solid #2a2f3a; background:var(--card); color:var(--fg); font-size:1rem; }
-    button { padding:12px 18px; border-radius:10px; border:0; background:#3b82f6; color:#fff; font-size:1rem; cursor:pointer; }
+    input { flex:1; min-width:0; padding:12px 14px; border-radius:10px; border:1px solid #2a2f3a; background:var(--card); color:var(--fg); font-size:1rem; }
+    button { padding:12px 16px; border-radius:10px; border:0; background:var(--accent); color:#fff; font-size:1rem; cursor:pointer; white-space:nowrap; }
+    button.ghost { background:#2a2f3a; color:var(--fg); }
+    button:disabled { opacity:.5; cursor:default; }
     .hint { color:var(--muted); font-size:.85rem; }
+    .results { list-style:none; padding:0; margin:12px 0; }
+    .results li { background:var(--card); border-radius:10px; padding:10px 12px; margin:6px 0; cursor:pointer; display:flex; justify-content:space-between; gap:8px; align-items:center; }
+    .results li:hover { outline:1px solid var(--accent); }
+    .results .dist { color:var(--muted); font-size:.8rem; }
     .stop { margin-top:20px; }
     .stop h2 { font-size:1.1rem; margin:0 0 2px; }
-    .feed { color:var(--muted); font-size:.8rem; margin-bottom:14px; }
+    .feed { display:flex; align-items:center; gap:8px; color:var(--muted); font-size:.8rem; margin-bottom:14px; }
+    .dot { width:8px; height:8px; border-radius:50%; background:#22c55e; animation:pulse 2s infinite; }
+    .dot.stale { background:#ef4444; animation:none; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
     .line { background:var(--card); border-radius:12px; padding:14px; margin:10px 0; border-left:5px solid var(--muted); }
     .line-head { display:flex; align-items:center; gap:10px; }
-    .badge { width:30px; height:30px; border-radius:8px; display:grid; place-items:center; font-weight:700; background:#2a2f3a; }
-    .line-name { font-weight:600; }
+    .badge { min-width:30px; height:30px; padding:0 6px; border-radius:8px; display:grid; place-items:center; font-weight:700; background:#2a2f3a; }
+    .line-name { font-weight:600; font-size:.95rem; }
     .status { margin-left:auto; font-size:.85rem; padding:4px 10px; border-radius:999px; font-weight:600; }
     .reason { color:var(--muted); font-size:.85rem; margin-top:6px; }
     table { width:100%; border-collapse:collapse; margin-top:10px; font-size:.9rem; }
@@ -36,6 +45,7 @@
     .s-reduced{border-left-color:#f97316} .s-stopped{border-left-color:#ef4444}
     .s-unknown{border-left-color:#6b7280}
     .err { color:#fca5a5; }
+    .flash { animation:flash 1s; } @keyframes flash { from{background:#1e2b3f} to{background:var(--card)} }
   </style>
 </head>
 <body>
@@ -45,59 +55,122 @@
   </header>
   <main>
     <form id="search">
-      <input id="q" placeholder="Rue, adresse ou arrêt (ex. Opéra, République…)" autocomplete="off" />
+      <input id="q" placeholder="Rue, adresse ou arrêt (ex. Guillemins, Sclessin…)" autocomplete="off" />
       <button>Chercher</button>
+      <button type="button" id="geo" class="ghost" title="Utiliser ma position">Ma position</button>
     </form>
-    <div class="hint">Données fictives (Liège) — en attendant le raccordement aux feeds TEC.</div>
+    <div class="hint" id="hint">Tapez un arrêt ou utilisez votre position. Mise à jour automatique en direct.</div>
+    <ul id="choices" class="results"></ul>
     <div id="results"></div>
   </main>
 
   <script>
     const LABEL = { normal:"Normal", perturbed:"Perturbé", reduced:"Réduit", stopped:"À l'arrêt", unknown:"Inconnu" };
     const fmt = iso => new Date(iso).toLocaleTimeString("fr-BE", { hour:"2-digit", minute:"2-digit" });
+    const $ = id => document.getElementById(id);
 
-    document.getElementById("search").addEventListener("submit", async (e) => {
+    let ws = null;
+    let currentStop = null;
+
+    // --- Recherche d'arrêts ---
+    $("search").addEventListener("submit", async (e) => {
       e.preventDefault();
-      const q = document.getElementById("q").value.trim();
-      const box = document.getElementById("results");
-      box.innerHTML = "";
+      const q = $("q").value.trim();
       if (!q) return;
       try {
         const stops = await (await fetch(`/api/search?q=${encodeURIComponent(q)}`)).json();
-        if (!stops.length) { box.innerHTML = '<p class="hint">Aucun arrêt trouvé.</p>'; return; }
-        for (const s of stops) {
-          const st = await (await fetch(`/api/status?stop=${encodeURIComponent(s.stop_id)}`)).json();
-          box.appendChild(renderStop(st));
-        }
-      } catch (err) {
-        box.innerHTML = `<p class="err">Erreur : ${err.message}</p>`;
-      }
+        renderChoices(stops);
+      } catch (err) { showError(err); }
     });
 
+    // --- Géolocalisation navigateur ---
+    $("geo").addEventListener("click", () => {
+      if (!navigator.geolocation) { $("hint").textContent = "Géolocalisation non supportée par le navigateur."; return; }
+      $("geo").disabled = true;
+      $("hint").textContent = "Localisation en cours…";
+      navigator.geolocation.getCurrentPosition(
+        async (pos) => {
+          const { latitude: lat, longitude: lon } = pos.coords;
+          try {
+            const stops = await (await fetch(`/api/nearby?lat=${lat}&lon=${lon}&radius=800`)).json();
+            renderChoices(stops, { nearby: true });
+            if (stops.length) selectStop(stops[0].stop_id, stops[0].name);
+            else $("hint").textContent = "Aucun arrêt dans un rayon de 800 m.";
+          } catch (err) { showError(err); }
+          finally { $("geo").disabled = false; }
+        },
+        (err) => { $("geo").disabled = false; $("hint").textContent = `Localisation refusée : ${err.message}`; },
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 }
+      );
+    });
+
+    function renderChoices(stops, opts = {}) {
+      const ul = $("choices"); ul.innerHTML = "";
+      if (!stops.length) { $("hint").textContent = "Aucun arrêt trouvé."; return; }
+      $("hint").textContent = `${stops.length} arrêt(s) — cliquez pour suivre en direct.`;
+      for (const s of stops) {
+        const li = document.createElement("li");
+        const dist = (s.metres != null) ? `<span class="dist">${Math.round(s.metres)} m</span>`
+                    : (opts.nearby ? "" : "");
+        li.innerHTML = `<span>${escapeHtml(s.name)}</span>${dist}`;
+        li.addEventListener("click", () => selectStop(s.stop_id, s.name));
+        ul.appendChild(li);
+      }
+    }
+
+    // --- Sélection d'un arrêt + WebSocket live ---
+    function selectStop(stopId, name) {
+      currentStop = stopId;
+      $("choices").innerHTML = "";
+      $("hint").textContent = `Suivi en direct : ${name}`;
+      connectLive(stopId);
+    }
+
+    function connectLive(stopId) {
+      if (ws) { ws.onclose = null; ws.close(); }
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      ws = new WebSocket(`${proto}://${location.host}/api/live?stop=${encodeURIComponent(stopId)}`);
+      ws.onmessage = (ev) => {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === "status") renderStop(msg.status);
+        else if (msg.type === "error") showError(new Error(msg.message));
+      };
+      ws.onerror = () => showError(new Error("Connexion temps réel interrompue."));
+      ws.onclose = () => { /* reconnexion gérée au prochain selectStop */ };
+    }
+
     function renderStop(st) {
+      if (currentStop && st.stop.stop_id !== currentStop) return;
+      const box = $("results");
+      const fresh = st.feed_age_secs != null && st.feed_age_secs < 120;
+      const maj = st.last_updated
+        ? `il y a ${st.feed_age_secs ?? "?"} s (${fmt(st.last_updated)})`
+        : "mise à jour inconnue";
+      box.innerHTML = "";
       const el = document.createElement("div");
       el.className = "stop";
-      const maj = st.last_updated ? `Dernière mise à jour : ${fmt(st.last_updated)} (il y a ${st.feed_age_secs ?? "?"} s)` : "Mise à jour inconnue";
-      el.innerHTML = `<h2>${st.stop.name}</h2><div class="feed">${maj}</div>`;
+      el.innerHTML = `<h2>${escapeHtml(st.stop.name)}</h2>
+        <div class="feed"><span class="dot ${fresh ? "" : "stale"}"></span>${maj}</div>`;
       for (const l of st.lines) {
         const rows = l.departures.map(d => {
           const obs = d.cancelled ? "annulé" : (d.observed ? fmt(d.observed) : "—");
-          const delta = (!d.cancelled && d.observed)
-            ? Math.round((new Date(d.observed) - new Date(d.scheduled)) / 60000) : null;
-          const deltaTxt = delta === null ? "—" : (delta > 0 ? `+${delta} min` : "à l'heure");
-          return `<tr><td>${l.line.short_name}</td><td>${d.headsign}</td><td>${fmt(d.scheduled)}</td><td>${obs}</td><td>${deltaTxt}</td></tr>`;
+          let deltaTxt = "—";
+          if (!d.cancelled && d.observed) {
+            const delta = Math.round((new Date(d.observed) - new Date(d.scheduled)) / 60000);
+            deltaTxt = delta > 0 ? `+${delta} min` : (delta < 0 ? `${delta} min` : "à l'heure");
+          }
+          return `<tr><td>${l.line.short_name}</td><td>${escapeHtml(d.headsign)}</td>
+                  <td>${fmt(d.scheduled)}</td><td>${obs}</td><td>${deltaTxt}</td></tr>`;
         }).join("");
         const div = document.createElement("div");
         div.className = `line s-${l.status}`;
         div.innerHTML = `
           <div class="line-head">
-            <div class="badge">${l.line.short_name}</div>
-            <div>
-              <div class="line-name">${l.line.long_name}</div>
-            </div>
+            <div class="badge">${escapeHtml(l.line.short_name)}</div>
+            <div class="line-name">${escapeHtml(l.line.long_name)}</div>
             <span class="status ${l.status}">${LABEL[l.status]}</span>
           </div>
-          ${l.reason ? `<div class="reason">${l.reason}</div>` : ""}
+          ${l.reason ? `<div class="reason">${escapeHtml(l.reason)}</div>` : ""}
           <table>
             <thead><tr><th>Ligne</th><th>Direction</th><th>Prévu</th><th>Observé</th><th>Écart</th></tr></thead>
             <tbody>${rows}</tbody>
@@ -108,7 +181,17 @@
       advice.className = "advice";
       advice.textContent = st.advice;
       el.appendChild(advice);
-      return el;
+      box.appendChild(el);
+      // Petit flash à chaque mise à jour.
+      el.classList.add("flash");
+      setTimeout(() => el.classList.remove("flash"), 1000);
+    }
+
+    function showError(err) {
+      $("results").innerHTML = `<p class="err">Erreur : ${escapeHtml(err.message)}</p>`;
+    }
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
     }
   </script>
 </body>

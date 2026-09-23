@@ -70,11 +70,14 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
+    let (events_tx, _events_rx) = tokio::sync::broadcast::channel(64);
+
     tokio::spawn(realtime::run(
         client,
         archive.clone(),
         raw,
         rt_state.clone(),
+        events_tx.clone(),
         cfg,
     ));
 
@@ -83,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
         gtfs: gtfs_repo,
         status: status_svc,
         rt: rt_state,
+        events: events_tx,
     });
 
     let addr = std::env::var("TRANSITPULSE_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".into());
