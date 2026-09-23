@@ -7,6 +7,7 @@ use tracing_subscriber::EnvFilter;
 use transitpulse::api::{AppState, router};
 use transitpulse::archive::Archive;
 use transitpulse::gtfs::{self, GtfsRepo};
+use transitpulse::network::NetworkService;
 use transitpulse::realtime::{self, RawArchive, RtConfig, RtState};
 use transitpulse::state::Repo;
 use transitpulse::status::StatusService;
@@ -53,24 +54,45 @@ async fn main() -> anyhow::Result<()> {
     let cache = gtfs::gtfs_cache_path(Path::new(&data_dir));
     let gtfs_url =
         std::env::var("TRANSITPULSE_GTFS_URL").unwrap_or_else(|_| gtfs::TEC_GTFS_URL.to_string());
-    let (gtfs_repo, status_svc) =
+    let (gtfs_repo, status_svc, network_svc) =
         match gtfs::fetch_and_load(&client, &gtfs_url, &cache, &gtfs_db).await {
             Ok(stats) => {
                 tracing::info!(?stats, "GTFS statique chargé");
                 let repo = GtfsRepo::open(&gtfs_db)?;
                 let svc = StatusService::open(&gtfs_db, &db_path)?;
+                let net = NetworkService::open(&gtfs_db, &db_path)?;
                 (
                     Some(Arc::new(Mutex::new(repo))),
                     Some(Arc::new(Mutex::new(svc))),
+                    Some(Arc::new(Mutex::new(net))),
                 )
             }
             Err(e) => {
                 tracing::error!(error = %e, "ETL GTFS échoué — repli sur le jeu fictif");
-                (None, None)
+                (None, None, None)
             }
         };
 
     let (events_tx, _events_rx) = tokio::sync::broadcast::channel(64);
+
+    // Reconstruction de la vue réseau à chaque cycle RT (coûteuse : sortie du
+    // chemin de requête HTTP).
+    if let Some(net) = &network_svc {
+        let net = net.clone();
+        let mut rx = events_tx.subscribe();
+        tokio::spawn(async move {
+            while rx.recv().await.is_ok() {
+                let net = net.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    match net.lock().expect("network mutex").rebuild_stats() {
+                        Ok(n) => tracing::debug!(communes = n, "vue réseau reconstruite"),
+                        Err(e) => tracing::warn!(error = %e, "rebuild réseau échoué"),
+                    }
+                })
+                .await;
+            }
+        });
+    }
 
     tokio::spawn(realtime::run(
         client,
@@ -85,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
         repo: Arc::new(Repo::mock()),
         gtfs: gtfs_repo,
         status: status_svc,
+        network: network_svc,
         rt: rt_state,
         events: events_tx,
     });

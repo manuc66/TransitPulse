@@ -80,6 +80,21 @@ pub struct StopStatus {
     pub last_updated: Option<DateTime<Utc>>,
     pub feed_age_secs: Option<u64>,
     pub advice: String,
+    /// Contexte systémique : état du réseau dans la commune de l'arrêt,
+    /// pour distinguer « mon bus est en retard » de « tout le réseau est à l'arrêt ».
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetworkContext>,
+}
+
+/// Résumé de l'état réseau local, vu depuis un arrêt.
+#[derive(Debug, Clone, Serialize)]
+pub struct NetworkContext {
+    pub commune: String,
+    pub status: String,
+    pub status_label: String,
+    pub cancelled_ratio: f64,
+    pub trips_cancelled: i64,
+    pub trips_scheduled: i64,
 }
 
 /// Seuils configurables du moteur de statut.

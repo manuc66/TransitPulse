@@ -53,6 +53,14 @@ CREATE TABLE IF NOT EXISTS rt_alert_trips (
     PRIMARY KEY (feed_ts, alert_id, trip_id)
 );
 CREATE INDEX IF NOT EXISTS idx_alert_trips_trip ON rt_alert_trips(trip_id, feed_ts);
+
+-- Vue réseau matérialisée (commune -> courses prévues/annulées), reconstruite
+-- une fois par cycle RT pour rester à coût constant côté requêtes HTTP.
+CREATE TABLE IF NOT EXISTS network_stats (
+    commune          TEXT PRIMARY KEY,
+    trips_scheduled  INTEGER NOT NULL,
+    trips_cancelled  INTEGER NOT NULL
+);
 "#;
 
 /// Une observation de passage issue du feed `trip-update`.

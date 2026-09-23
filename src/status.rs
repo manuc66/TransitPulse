@@ -6,10 +6,13 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use chrono::{NaiveDateTime, TimeZone, Timelike, Utc};
 use chrono_tz::Europe::Brussels;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
-use crate::domain::{self, Departure, LineStatus, ServiceStatus, StopStatus, Thresholds, evaluate};
+use crate::domain::{
+    self, Departure, LineStatus, NetworkContext, ServiceStatus, StopStatus, Thresholds, evaluate,
+};
 use crate::gtfs::GtfsRepo;
+use crate::network::{CommuneStatus, NetworkStatus, NetworkThresholds, commune_from_stop_name};
 
 /// Fenêtre de passage affichée (minutes de service).
 const HORIZON_MIN: i64 = 60;
@@ -24,6 +27,7 @@ pub struct StatusService {
     archive: Connection,
     thresholds: Thresholds,
     stale_after: i64,
+    network: NetworkThresholds,
 }
 
 impl StatusService {
@@ -44,6 +48,7 @@ impl StatusService {
             archive,
             thresholds: Thresholds::default(),
             stale_after: Thresholds::default().stale_feed_secs as i64,
+            network: NetworkThresholds::default(),
         })
     }
 
@@ -142,12 +147,16 @@ impl StatusService {
             .min_by_key(|s| severity_rank(*s))
             .unwrap_or(ServiceStatus::Unknown);
 
+        // Contexte systémique de la commune de l'arrêt.
+        let network = self.network_context(&stop.name)?;
+
         Ok(Some(StopStatus {
             stop,
             lines,
             last_updated: feed_age.map(|a| Utc::now() - chrono::Duration::seconds(a)),
             feed_age_secs: feed_age.map(|a| a.max(0) as u64),
             advice: domain::advice(worst).to_string(),
+            network,
         }))
     }
 
@@ -272,6 +281,77 @@ impl StatusService {
 
         Ok(out)
     }
+
+    /// Contexte systémique pour la commune d'un arrêt : part de courses
+    /// annulées, calculée sur la même base attachée.
+    fn network_context(&self, stop_name: &str) -> Result<Option<NetworkContext>> {
+        let Some(commune) = commune_from_stop_name(stop_name) else {
+            return Ok(None);
+        };
+        let status = self.commune_stats(&commune)?;
+        Ok(status.map(|c| NetworkContext {
+            commune: c.commune,
+            status: match c.status {
+                NetworkStatus::Normal => "normal",
+                NetworkStatus::Degraded => "degraded",
+                NetworkStatus::Critical => "critical",
+            }
+            .to_string(),
+            status_label: c.status_label,
+            cancelled_ratio: c.cancelled_ratio,
+            trips_cancelled: c.trips_cancelled,
+            trips_scheduled: c.trips_scheduled,
+        }))
+    }
+
+    /// Compteurs d'annulation pour une commune, lus depuis la table
+    /// matérialisée `network_stats` (reconstruite à chaque cycle RT).
+    fn commune_stats(&self, commune: &str) -> Result<Option<CommuneStatus>> {
+        let row = self
+            .archive
+            .query_row(
+                "SELECT trips_scheduled, trips_cancelled FROM main.network_stats
+                 WHERE upper(commune) = upper(?1)",
+                [commune],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let Some((sched, ann)) = row else {
+            return Ok(None);
+        };
+        // Recalcule le statut via les seuils réseau.
+        Ok(Some(derive_commune_status(
+            CommuneStatus {
+                commune: commune.to_string(),
+                trips_scheduled: sched,
+                trips_cancelled: ann,
+                cancelled_ratio: if sched == 0 {
+                    0.0
+                } else {
+                    ann as f64 / sched as f64
+                },
+                status: NetworkStatus::Normal,
+                status_label: String::new(),
+            },
+            self.network,
+        )))
+    }
+}
+
+/// Applique les seuils réseau à des compteurs déjà calculés.
+fn derive_commune_status(mut c: CommuneStatus, th: NetworkThresholds) -> CommuneStatus {
+    let st = if c.trips_scheduled == 0 {
+        NetworkStatus::Normal
+    } else if c.trips_cancelled >= th.min_annulled && c.cancelled_ratio >= th.critical_ratio {
+        NetworkStatus::Critical
+    } else if c.trips_cancelled >= th.min_annulled && c.cancelled_ratio >= th.degraded_ratio {
+        NetworkStatus::Degraded
+    } else {
+        NetworkStatus::Normal
+    };
+    c.status = st;
+    c.status_label = st.label().to_string();
+    c
 }
 
 /// Alertes actives résumées pour un arrêt.

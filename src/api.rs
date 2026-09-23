@@ -18,6 +18,7 @@ use tower_http::services::ServeDir;
 
 use crate::domain::StopStatus;
 use crate::gtfs::GtfsRepo;
+use crate::network::{CommuneStatus, NetworkService};
 use crate::realtime::{LiveEvent, RtState};
 use crate::state::Repo;
 use crate::status::StatusService;
@@ -31,6 +32,8 @@ pub struct AppState {
     pub gtfs: Option<Arc<Mutex<GtfsRepo>>>,
     /// Service de statut réel.
     pub status: Option<Arc<Mutex<StatusService>>>,
+    /// Vue systémique du réseau (None tant que l'ETL n'a pas tourné).
+    pub network: Option<Arc<Mutex<NetworkService>>>,
     pub rt: Arc<RwLock<RtState>>,
     /// Flux d'événements RT pour les abonnés WebSocket.
     pub events: broadcast::Sender<LiveEvent>,
@@ -42,6 +45,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/search", get(search))
         .route("/api/status", get(status))
         .route("/api/nearby", get(nearby))
+        .route("/api/network", get(network))
         .route("/api/freshness", get(freshness))
         .route("/api/live", get(live))
         .fallback_service(ServeDir::new("web"))
@@ -253,6 +257,57 @@ enum LiveMessage {
         stop_id: String,
         message: String,
     },
+}
+
+#[derive(Deserialize)]
+struct NetworkParams {
+    commune: Option<String>,
+}
+
+#[derive(Serialize)]
+struct NetworkView {
+    /// Commune la plus préoccupante du réseau.
+    worst: Option<CommuneStatus>,
+    /// Nombre de communes en état dégradé ou critique (signal d'événement).
+    degraded_communes: usize,
+    critical_communes: usize,
+    communes: Vec<CommuneStatus>,
+}
+
+/// Vue systémique du réseau : annulations par commune, détection d'événement.
+async fn network(
+    State(state): State<AppState>,
+    Query(p): Query<NetworkParams>,
+) -> Result<Json<NetworkView>, ApiError> {
+    let Some(net) = &state.network else {
+        return Err(ApiError::Internal("GTFS non chargé".into()));
+    };
+    let net = net.lock().expect("network mutex");
+    let communes = net
+        .communes(p.commune.as_deref())
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let degraded = communes
+        .iter()
+        .filter(|c| c.status == crate::network::NetworkStatus::Degraded)
+        .count();
+    let critical = communes
+        .iter()
+        .filter(|c| c.status == crate::network::NetworkStatus::Critical)
+        .count();
+    // Ne remonte que les signalées, top 20, pour éviter un payload énorme.
+    let mut shown: Vec<_> = communes
+        .iter()
+        .filter(|c| c.status != crate::network::NetworkStatus::Normal)
+        .cloned()
+        .collect();
+    shown.truncate(20);
+    let worst = shown.first().cloned();
+    Ok(Json(NetworkView {
+        worst,
+        degraded_communes: degraded,
+        critical_communes: critical,
+        communes: shown,
+    }))
 }
 
 #[derive(Serialize)]
