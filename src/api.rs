@@ -35,6 +35,8 @@ pub struct AppState {
     /// Vue systémique du réseau (None tant que l'ETL n'a pas tourné).
     pub network: Option<Arc<Mutex<NetworkService>>>,
     pub rt: Arc<RwLock<RtState>>,
+    /// Client HTTP partagé (géocodage).
+    pub http: reqwest::Client,
     /// Flux d'événements RT pour les abonnés WebSocket.
     pub events: broadcast::Sender<LiveEvent>,
 }
@@ -65,16 +67,111 @@ struct SearchParams {
     q: String,
 }
 
+#[derive(Serialize)]
+struct SearchResult {
+    /// Arrêts correspondant au nom recherché.
+    stops: Vec<crate::gtfs::NearbyStop>,
+    /// Si la requête a été comprise comme une adresse : point géocodé.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<crate::geo::Geocoded>,
+    /// Message éventuel (adresse introuvable, hors couverture…).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+
+/// Heuristique : la requête ressemble-t-elle à une adresse (numéro de rue) ?
+fn looks_like_address(q: &str) -> bool {
+    q.chars().any(|c| c.is_ascii_digit())
+}
+
 async fn search(
     State(state): State<AppState>,
     Query(p): Query<SearchParams>,
-) -> Json<Vec<crate::domain::Stop>> {
-    if let Some(gtfs) = &state.gtfs
-        && let Ok(stops) = gtfs.lock().expect("gtfs mutex").search_stops(&p.q, 10)
-    {
-        return Json(stops);
+) -> Json<SearchResult> {
+    let Some(gtfs) = &state.gtfs else {
+        let stops = state
+            .repo
+            .search(&p.q)
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        return Json(SearchResult {
+            stops,
+            origin: None,
+            note: None,
+        });
+    };
+
+    // 1) Recherche par nom d'arrêt.
+    let by_name = gtfs
+        .lock()
+        .expect("gtfs mutex")
+        .search_stops(&p.q, 10)
+        .unwrap_or_default();
+    if !by_name.is_empty() && !looks_like_address(&p.q) {
+        return Json(SearchResult {
+            stops: nearby_from_stops(gtfs, &by_name),
+            origin: None,
+            note: None,
+        });
     }
-    Json(state.repo.search(&p.q))
+
+    // 2) Aucun arrêt (ou adresse) : géocodage puis arrêts les plus proches.
+    match crate::geo::geocode(&state.http, &p.q).await {
+        Ok(Some(g)) => {
+            let radius = 1200.0;
+            let stops = gtfs
+                .lock()
+                .expect("gtfs mutex")
+                .nearby_stops(g.lat, g.lon, radius)
+                .unwrap_or_default();
+            let note = if stops.is_empty() {
+                Some(format!(
+                    "Aucun arrêt dans un rayon de {radius:.0} m autour de « {} »",
+                    g.label
+                ))
+            } else {
+                None
+            };
+            Json(SearchResult {
+                stops,
+                origin: Some(g),
+                note,
+            })
+        }
+        _ => {
+            // Repli : renvoie ce que la recherche par nom a trouvé (souvent vide).
+            Json(SearchResult {
+                stops: nearby_from_stops(gtfs, &by_name),
+                origin: None,
+                note: if by_name.is_empty() {
+                    Some("Adresse introuvable".to_string())
+                } else {
+                    None
+                },
+            })
+        }
+    }
+}
+
+/// Convertit des `Stop` (sans distance) en `NearbyStop` (distance inconnue = 0,
+/// desservi à vérifier côté requête).
+fn nearby_from_stops(
+    gtfs: &Arc<Mutex<GtfsRepo>>,
+    stops: &[crate::domain::Stop],
+) -> Vec<crate::gtfs::NearbyStop> {
+    let guard = gtfs.lock().expect("gtfs mutex");
+    stops
+        .iter()
+        .map(|s| {
+            let served = guard.stop_is_served(&s.stop_id).unwrap_or(false);
+            crate::gtfs::NearbyStop {
+                stop: s.clone(),
+                metres: 0.0,
+                served,
+            }
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -365,5 +462,18 @@ impl IntoResponse for ApiError {
             ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
         };
         (code, Json(serde_json::json!({ "error": msg }))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::looks_like_address;
+
+    #[test]
+    fn detection_adresse() {
+        assert!(looks_like_address("Rue de la Station 12"));
+        assert!(looks_like_address("Place Centrale 1"));
+        assert!(!looks_like_address("Guillemins"));
+        assert!(!looks_like_address("Opéra"));
     }
 }

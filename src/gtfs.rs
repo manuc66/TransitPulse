@@ -625,6 +625,16 @@ impl GtfsRepo {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Indique si un arrêt est effectivement desservi (au moins une course).
+    pub fn stop_is_served(&self, stop_id: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM gtfs_stop_times WHERE stop_id = ?1)",
+            params![stop_id],
+            |r| r.get(0),
+        )?;
+        Ok(n != 0)
+    }
+
     /// Une ligne par `route_id`.
     pub fn route(&self, route_id: &str) -> Result<Option<Line>> {
         let mut stmt = self.conn.prepare(
@@ -761,6 +771,16 @@ pub struct NearbyStop {
     pub stop: Stop,
     pub metres: f64,
     pub served: bool,
+}
+
+impl From<Stop> for NearbyStop {
+    fn from(stop: Stop) -> Self {
+        Self {
+            stop,
+            metres: 0.0,
+            served: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

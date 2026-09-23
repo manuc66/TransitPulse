@@ -82,14 +82,23 @@
     let ws = null;
     let currentStop = null;
 
-    // --- Recherche d'arrêts ---
+    // --- Recherche d'arrêts (nom ou adresse) ---
     $("search").addEventListener("submit", async (e) => {
       e.preventDefault();
       const q = $("q").value.trim();
       if (!q) return;
+      $("hint").textContent = "Recherche…";
       try {
-        const stops = await (await fetch(`/api/search?q=${encodeURIComponent(q)}`)).json();
-        renderChoices(stops);
+        const res = await (await fetch(`/api/search?q=${encodeURIComponent(q)}`)).json();
+        if (res.origin) {
+          $("hint").textContent = `Adresse trouvée : ${res.origin.label}`;
+        }
+        if (res.note && !res.stops.length) {
+          $("choices").innerHTML = "";
+          $("hint").textContent = res.note;
+          return;
+        }
+        renderChoices(res.stops, { nearby: !!res.origin });
       } catch (err) { showError(err); }
     });
 
@@ -133,8 +142,25 @@
       currentStop = stopId;
       $("choices").innerHTML = "";
       $("hint").textContent = `Suivi en direct : ${name}`;
+      // Arrêt partageable : on le reflète dans l'URL.
+      const url = new URL(location);
+      url.searchParams.set("stop", stopId);
+      if (name) url.searchParams.set("name", name);
+      history.replaceState(null, "", url);
+      document.title = name ? `${name} — TransitPulse` : "TransitPulse";
       connectLive(stopId);
     }
+
+    // Au chargement : si l'URL porte un arrêt, on le suit directement.
+    (function initFromUrl() {
+      const params = new URLSearchParams(location.search);
+      const stop = params.get("stop");
+      const name = params.get("name") || stop;
+      if (stop) {
+        $("hint").textContent = `Suivi en direct : ${name}`;
+        selectStop(stop, name);
+      }
+    })();
 
     function connectLive(stopId) {
       if (ws) { ws.onclose = null; ws.close(); }

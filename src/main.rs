@@ -94,6 +94,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    let http_client = client.clone();
     tokio::spawn(realtime::run(
         client,
         archive.clone(),
@@ -110,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
         network: network_svc,
         rt: rt_state,
         events: events_tx,
+        http: http_client,
     });
 
     let addr = std::env::var("TRANSITPULSE_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".into());
