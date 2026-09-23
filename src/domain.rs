@@ -70,6 +70,48 @@ pub struct LineStatus {
     pub status: ServiceStatus,
     pub departures: Vec<Departure>,
     pub reason: Option<String>,
+    /// Preuves qui justifient le statut (retards observés, annulations, alerte,
+    /// fraîcheur des données…). Rend le verdict vérifiable, qu'il soit rassurant
+    /// ou alarmant.
+    pub evidence: Vec<Evidence>,
+    /// Phrase courte résumant sur quoi repose le statut.
+    pub basis: String,
+}
+
+/// Nature d'une preuve appuyant un statut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceKind {
+    /// Données temps réel fraîches disponibles.
+    DataFresh,
+    /// Données temps réel absentes ou périmées.
+    DataStale,
+    /// Alerte de service (interruption annoncée).
+    NoServiceAlert,
+    /// Passages annulés.
+    Cancelled,
+    /// Retards observés.
+    Delay,
+    /// Passages à l'heure (observés).
+    OnTime,
+    /// Aucun passage prévu (fin de service / ligne non desservante).
+    NoScheduledService,
+}
+
+/// Preuve élémentaire justifiant (ou nuançant) un statut.
+#[derive(Debug, Clone, Serialize)]
+pub struct Evidence {
+    pub kind: EvidenceKind,
+    pub detail: String,
+}
+
+impl Evidence {
+    pub fn new(kind: EvidenceKind, detail: impl Into<String>) -> Self {
+        Self {
+            kind,
+            detail: detail.into(),
+        }
+    }
 }
 
 /// Réponse complète pour un arrêt : toutes les lignes qui devraient y passer.
@@ -118,7 +160,30 @@ impl Default for Thresholds {
     }
 }
 
-/// Décide du statut d'une ligne à partir de ses prochains passages.
+/// Verdict du moteur : statut, raison courte, et preuves détaillées.
+#[derive(Debug, Clone)]
+pub struct Verdict {
+    pub status: ServiceStatus,
+    pub reason: Option<String>,
+    pub evidence: Vec<Evidence>,
+}
+
+impl Verdict {
+    /// Phrase résumant sur quoi le statut repose.
+    pub fn basis(&self) -> String {
+        if self.evidence.is_empty() {
+            return "Aucune donnée exploitable".to_string();
+        }
+        self.evidence
+            .iter()
+            .map(|e| e.detail.clone())
+            .collect::<Vec<_>>()
+            .join(" ; ")
+    }
+}
+
+/// Décide du statut d'une ligne à partir de ses prochains passages, **et**
+/// documente les preuves qui l'étayent.
 ///
 /// `rt_fresh` indique si l'on dispose de données temps réel récentes pour cette
 /// ligne. `severe_alert` porte un message si une alerte majeure couvre la ligne.
@@ -130,61 +195,141 @@ pub fn evaluate(
     rt_fresh: bool,
     severe_alert: Option<&str>,
     thresholds: Thresholds,
-) -> (ServiceStatus, Option<String>) {
+) -> Verdict {
     if departures.is_empty() {
-        return (
-            ServiceStatus::Stopped,
-            Some("Aucun passage prévu à cet arrêt".to_string()),
-        );
+        return Verdict {
+            status: ServiceStatus::Stopped,
+            reason: Some("Aucun passage prévu à cet arrêt".to_string()),
+            evidence: vec![Evidence::new(
+                EvidenceKind::NoScheduledService,
+                "aucun passage prévu dans l'heure à venir",
+            )],
+        };
     }
 
-    if !rt_fresh {
-        return (
-            ServiceStatus::Unknown,
-            Some("Données temps réel indisponibles ou trop anciennes".to_string()),
-        );
-    }
-
-    if let Some(msg) = severe_alert {
-        return (ServiceStatus::Stopped, Some(msg.to_string()));
-    }
-
-    let total = departures.len() as f64;
-    let cancelled = departures.iter().filter(|d| d.cancelled).count() as f64;
-    let ratio = cancelled / total;
-
-    if ratio >= 1.0 {
-        return (
-            ServiceStatus::Stopped,
-            Some("Tous les passages sont annulés".to_string()),
-        );
-    }
-
-    if ratio >= thresholds.reduced_cancelled_ratio {
-        return (
-            ServiceStatus::Reduced,
-            Some(format!(
-                "{} % des passages annulés",
-                (ratio * 100.0).round()
-            )),
-        );
-    }
-
-    let max_delay = departures
+    let total = departures.len();
+    let cancelled = departures.iter().filter(|d| d.cancelled).count();
+    let observed: Vec<i64> = departures
         .iter()
         .filter(|d| !d.cancelled)
         .filter_map(|d| d.delay_secs())
-        .max()
-        .unwrap_or(0);
+        .collect();
+    let delays_detail = || {
+        observed
+            .iter()
+            .map(|s| format!("{:+} min", s / 60))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
 
-    if max_delay >= thresholds.late_secs {
-        return (
-            ServiceStatus::Perturbed,
-            Some(format!("Retard jusqu'à {} min", max_delay / 60)),
-        );
+    if !rt_fresh {
+        return Verdict {
+            status: ServiceStatus::Unknown,
+            reason: Some("Données temps réel indisponibles ou trop anciennes".to_string()),
+            evidence: vec![
+                Evidence::new(EvidenceKind::DataStale, "aucune donnée temps réel fraîche"),
+                Evidence::new(
+                    EvidenceKind::NoScheduledService,
+                    format!("{total} passage(s) prévu(s) au horaire théorique"),
+                ),
+            ],
+        };
     }
 
-    (ServiceStatus::Normal, None)
+    if let Some(msg) = severe_alert {
+        return Verdict {
+            status: ServiceStatus::Stopped,
+            reason: Some(msg.to_string()),
+            evidence: vec![
+                Evidence::new(EvidenceKind::NoServiceAlert, format!("alerte : {msg}")),
+                Evidence::new(
+                    EvidenceKind::DataFresh,
+                    "flux temps réel à jour au moment du verdict",
+                ),
+            ],
+        };
+    }
+
+    let ratio = cancelled as f64 / total as f64;
+
+    if ratio >= 1.0 {
+        return Verdict {
+            status: ServiceStatus::Stopped,
+            reason: Some("Tous les passages sont annulés".to_string()),
+            evidence: vec![
+                Evidence::new(
+                    EvidenceKind::Cancelled,
+                    format!("{cancelled}/{total} passages annulés"),
+                ),
+                Evidence::new(EvidenceKind::DataFresh, "données temps réel fraîches"),
+            ],
+        };
+    }
+
+    if ratio >= thresholds.reduced_cancelled_ratio {
+        return Verdict {
+            status: ServiceStatus::Reduced,
+            reason: Some(format!(
+                "{} % des passages annulés",
+                (ratio * 100.0).round()
+            )),
+            evidence: vec![
+                Evidence::new(
+                    EvidenceKind::Cancelled,
+                    format!("{cancelled}/{total} passages annulés"),
+                ),
+                Evidence::new(EvidenceKind::DataFresh, "données temps réel fraîches"),
+            ],
+        };
+    }
+
+    let max_delay = observed.iter().copied().max().unwrap_or(0);
+
+    if max_delay >= thresholds.late_secs {
+        return Verdict {
+            status: ServiceStatus::Perturbed,
+            reason: Some(format!("Retard jusqu'à {} min", max_delay / 60)),
+            evidence: vec![
+                Evidence::new(
+                    EvidenceKind::Delay,
+                    format!("retards observés : {}", delays_detail()),
+                ),
+                Evidence::new(EvidenceKind::DataFresh, "données temps réel fraîches"),
+            ],
+        };
+    }
+
+    // Normal : on montrer explicitement ce qui rassure (preuves positives).
+    let mut evidence = vec![Evidence::new(
+        EvidenceKind::DataFresh,
+        "données temps réel fraîches",
+    )];
+    if observed.is_empty() {
+        evidence.push(Evidence::new(
+            EvidenceKind::NoScheduledService,
+            "passages au horaire théorique (pas encore de prédiction temps réel)",
+        ));
+    } else {
+        evidence.push(Evidence::new(
+            EvidenceKind::OnTime,
+            if observed.iter().all(|s| *s == 0) {
+                "passages observés à l'heure".to_string()
+            } else {
+                format!("écarts dans les limites : {}", delays_detail())
+            },
+        ));
+    }
+    if cancelled > 0 {
+        evidence.push(Evidence::new(
+            EvidenceKind::Cancelled,
+            format!("{cancelled}/{total} annulé(s), sous le seuil"),
+        ));
+    }
+    Verdict {
+        status: ServiceStatus::Normal,
+        reason: None,
+        evidence,
+    }
 }
 
 /// Phrase d'aide à la décision associée à un statut.
@@ -215,65 +360,96 @@ mod tests {
         }
     }
 
+    fn has_evidence(v: &Verdict, kind: EvidenceKind) -> bool {
+        v.evidence.iter().any(|e| e.kind == kind)
+    }
+
     #[test]
-    fn a_lheure_est_normal() {
+    fn a_lheure_est_normal_avec_preuve() {
         let deps = vec![dep(5, 0, false), dep(20, 30, false)];
-        let (s, _) = evaluate(&deps, true, None, Thresholds::default());
-        assert_eq!(s, ServiceStatus::Normal);
+        let v = evaluate(&deps, true, None, Thresholds::default());
+        assert_eq!(v.status, ServiceStatus::Normal);
+        // Un verdict « normal » s'appuie sur une preuve explicite.
+        assert!(has_evidence(&v, EvidenceKind::DataFresh));
+        assert!(has_evidence(&v, EvidenceKind::OnTime));
+        assert!(v.basis().contains("temps réel"));
     }
 
     #[test]
     fn retard_au_dela_du_seuil_est_perturbe() {
         let deps = vec![dep(5, 300, false)];
-        let (s, r) = evaluate(&deps, true, None, Thresholds::default());
-        assert_eq!(s, ServiceStatus::Perturbed);
-        assert!(r.unwrap().contains("5 min"));
+        let v = evaluate(&deps, true, None, Thresholds::default());
+        assert_eq!(v.status, ServiceStatus::Perturbed);
+        assert!(v.reason.as_deref().unwrap().contains("5 min"));
+        assert!(has_evidence(&v, EvidenceKind::Delay));
     }
 
     #[test]
     fn moitie_annulee_est_reduit() {
         let deps = vec![dep(5, 0, true), dep(20, 0, false)];
-        let (s, _) = evaluate(&deps, true, None, Thresholds::default());
-        assert_eq!(s, ServiceStatus::Reduced);
+        let v = evaluate(&deps, true, None, Thresholds::default());
+        assert_eq!(v.status, ServiceStatus::Reduced);
+        assert!(has_evidence(&v, EvidenceKind::Cancelled));
     }
 
     #[test]
     fn tout_annule_est_arrete() {
         let deps = vec![dep(5, 0, true), dep(20, 0, true)];
-        let (s, _) = evaluate(&deps, true, None, Thresholds::default());
-        assert_eq!(s, ServiceStatus::Stopped);
+        let v = evaluate(&deps, true, None, Thresholds::default());
+        assert_eq!(v.status, ServiceStatus::Stopped);
+        assert!(v.evidence.iter().any(|e| e.detail.contains("2/2")));
     }
 
     #[test]
-    fn aucun_passage_est_arrete() {
-        let (s, _) = evaluate(&[], true, None, Thresholds::default());
-        assert_eq!(s, ServiceStatus::Stopped);
+    fn aucun_passage_est_arrete_avec_preuve() {
+        let v = evaluate(&[], true, None, Thresholds::default());
+        assert_eq!(v.status, ServiceStatus::Stopped);
+        assert!(has_evidence(&v, EvidenceKind::NoScheduledService));
     }
 
     #[test]
     fn alerte_severe_est_arrete() {
         let deps = vec![dep(5, 0, false)];
-        let (s, r) = evaluate(
+        let v = evaluate(
             &deps,
             true,
             Some("Ligne interrompue"),
             Thresholds::default(),
         );
-        assert_eq!(s, ServiceStatus::Stopped);
-        assert_eq!(r.unwrap(), "Ligne interrompue");
+        assert_eq!(v.status, ServiceStatus::Stopped);
+        assert_eq!(v.reason.as_deref(), Some("Ligne interrompue"));
+        assert!(has_evidence(&v, EvidenceKind::NoServiceAlert));
     }
 
     #[test]
     fn sans_rt_frais_et_service_prevu_est_inconnu() {
         let deps = vec![dep(5, 0, false)];
-        let (s, _) = evaluate(&deps, false, None, Thresholds::default());
-        assert_eq!(s, ServiceStatus::Unknown);
+        let v = evaluate(&deps, false, None, Thresholds::default());
+        assert_eq!(v.status, ServiceStatus::Unknown);
+        assert!(has_evidence(&v, EvidenceKind::DataStale));
+    }
+
+    #[test]
+    fn normal_sans_prediction_explique_le_theorique() {
+        // Aucun observé (pas de prédiction RT) : la preuve doit dire que le
+        // verdict repose sur l'horaire théorique, pas sur une observation.
+        let deps = vec![Departure {
+            trip_id: "t".into(),
+            headsign: "Test".into(),
+            scheduled: Utc::now(),
+            observed: None,
+            cancelled: false,
+        }];
+        let v = evaluate(&deps, true, None, Thresholds::default());
+        assert_eq!(v.status, ServiceStatus::Normal);
+        assert!(has_evidence(&v, EvidenceKind::NoScheduledService));
+        assert!(v.basis().contains("théorique"));
     }
 
     #[test]
     fn sans_rt_frais_et_aucun_service_reste_arrete() {
         // Le statique est fiable : pas de service prévu -> arrêt, même sans RT.
-        let (s, _) = evaluate(&[], false, None, Thresholds::default());
-        assert_eq!(s, ServiceStatus::Stopped);
+        let v = evaluate(&[], false, None, Thresholds::default());
+        assert_eq!(v.status, ServiceStatus::Stopped);
     }
 }

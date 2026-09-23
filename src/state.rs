@@ -258,12 +258,15 @@ fn make_line_status(
     severe_alert: Option<&str>,
     thresholds: Thresholds,
 ) -> LineStatus {
-    let (status, reason) = domain::evaluate(&departures, rt_fresh, severe_alert, thresholds);
+    let verdict = domain::evaluate(&departures, rt_fresh, severe_alert, thresholds);
+    let basis = verdict.basis();
     LineStatus {
         line: line.clone(),
-        status,
+        status: verdict.status,
         departures,
-        reason,
+        reason: verdict.reason,
+        basis,
+        evidence: verdict.evidence,
     }
 }
 

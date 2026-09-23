@@ -262,6 +262,8 @@ enum LiveMessage {
 #[derive(Deserialize)]
 struct NetworkParams {
     commune: Option<String>,
+    /// Si fourni (ex. `gr:tec:L0032-20034`), renvoie le ratio de la ligne.
+    line: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -272,9 +274,14 @@ struct NetworkView {
     degraded_communes: usize,
     critical_communes: usize,
     communes: Vec<CommuneStatus>,
+    /// Zones/dépôts TEC, triés par part d'annulation.
+    zones: Vec<crate::network::ZoneStatus>,
+    /// Ratio ciblé d'une ligne (si `line=` demandé).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line: Option<crate::network::LineStatus>,
 }
 
-/// Vue systémique du réseau : annulations par commune, détection d'événement.
+/// Vue systémique du réseau : annulations par commune/zone, détection d'événement.
 async fn network(
     State(state): State<AppState>,
     Query(p): Query<NetworkParams>,
@@ -286,6 +293,13 @@ async fn network(
     let communes = net
         .communes(p.commune.as_deref())
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let zones = net.zones().map_err(|e| ApiError::Internal(e.to_string()))?;
+    let line = match &p.line {
+        Some(rid) => net
+            .line_ratio(rid)
+            .map_err(|e| ApiError::Internal(e.to_string()))?,
+        None => None,
+    };
     let degraded = communes
         .iter()
         .filter(|c| c.status == crate::network::NetworkStatus::Degraded)
@@ -307,6 +321,8 @@ async fn network(
         degraded_communes: degraded,
         critical_communes: critical,
         communes: shown,
+        zones,
+        line,
     }))
 }
 

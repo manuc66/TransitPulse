@@ -34,6 +34,16 @@
     .line-name { font-weight:600; font-size:.95rem; }
     .status { margin-left:auto; font-size:.85rem; padding:4px 10px; border-radius:999px; font-weight:600; }
     .reason { color:var(--muted); font-size:.85rem; margin-top:6px; }
+    .basis { margin-top:8px; font-size:.85rem; color:#cbd5e1; }
+    .evidence { list-style:none; padding:0; margin:6px 0 0; display:flex; flex-wrap:wrap; gap:6px; }
+    .evidence li { font-size:.78rem; padding:3px 9px; border-radius:999px; background:#232833; color:#cbd5e1; }
+    .evidence li.ev-data_fresh { background:#14532d; color:#86efac; }
+    .evidence li.ev-data_stale { background:#7f1d1d; color:#fca5a5; }
+    .evidence li.ev-cancelled { background:#7c2d12; color:#fdba74; }
+    .evidence li.ev-no_service_alert { background:#7f1d1d; color:#fca5a5; }
+    .evidence li.ev-delay { background:#78350f; color:#fdba74; }
+    .evidence li.ev-on_time { background:#14532d; color:#86efac; }
+    .evidence li.ev-no_scheduled_service { background:#374151; color:#d1d5db; }
     table { width:100%; border-collapse:collapse; margin-top:10px; font-size:.9rem; }
     th,td { text-align:left; padding:4px 6px; border-bottom:1px solid #232833; }
     th { color:var(--muted); font-weight:500; }
@@ -171,6 +181,10 @@
             <span class="status ${l.status}">${LABEL[l.status]}</span>
           </div>
           ${l.reason ? `<div class="reason">${escapeHtml(l.reason)}</div>` : ""}
+          <div class="basis">Pourquoi&nbsp;: ${escapeHtml(l.basis || "—")}</div>
+          ${(l.evidence && l.evidence.length)
+            ? `<ul class="evidence">${l.evidence.map(e => `<li class="ev-${e.kind}">${escapeHtml(e.detail)}</li>`).join("")}</ul>`
+            : ""}
           <table>
             <thead><tr><th>Ligne</th><th>Direction</th><th>Prévu</th><th>Observé</th><th>Écart</th></tr></thead>
             <tbody>${rows}</tbody>

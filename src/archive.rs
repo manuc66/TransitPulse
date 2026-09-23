@@ -61,6 +61,13 @@ CREATE TABLE IF NOT EXISTS network_stats (
     trips_scheduled  INTEGER NOT NULL,
     trips_cancelled  INTEGER NOT NULL
 );
+
+-- Même vue, agrégée par zone/dépôt TEC (préfixe de ligne : L, H, C, N, B, X).
+CREATE TABLE IF NOT EXISTS network_zones (
+    zone             TEXT PRIMARY KEY,
+    trips_scheduled  INTEGER NOT NULL,
+    trips_cancelled  INTEGER NOT NULL
+);
 "#;
 
 /// Une observation de passage issue du feed `trip-update`.

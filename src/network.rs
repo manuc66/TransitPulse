@@ -67,28 +67,45 @@ pub struct CommuneStatus {
 impl CommuneStatus {
     /// Détermine le statut à partir des compteurs et des seuils.
     fn derive(commune: String, scheduled: i64, cancelled: i64, th: NetworkThresholds) -> Self {
-        let ratio = if scheduled > 0 {
-            cancelled as f64 / scheduled as f64
-        } else {
-            0.0
-        };
-        let status = if scheduled == 0 {
-            NetworkStatus::Normal
-        } else if cancelled >= th.min_annulled && ratio >= th.critical_ratio {
-            NetworkStatus::Critical
-        } else if cancelled >= th.min_annulled && ratio >= th.degraded_ratio {
-            NetworkStatus::Degraded
-        } else {
-            NetworkStatus::Normal
-        };
+        let status = derive_status(scheduled, cancelled, th);
         Self {
             commune,
             trips_scheduled: scheduled,
             trips_cancelled: cancelled,
-            cancelled_ratio: ratio,
+            cancelled_ratio: if scheduled > 0 {
+                cancelled as f64 / scheduled as f64
+            } else {
+                0.0
+            },
             status,
             status_label: status.label().to_string(),
         }
+    }
+}
+
+/// Zone/dépôt TEC déduit du préfixe de `route_id` :
+/// `gr:tec:L0002-…` -> `L`. Les préfixes connus : B (Brabant), C (Charleroi),
+/// H (Hainaut), L (Liège-Verviers), N (Namur), X (Luxembourg).
+pub fn zone_from_route_id(route_id: &str) -> Option<String> {
+    let rest = route_id.strip_prefix("gr:tec:")?;
+    let c = rest.chars().next()?;
+    if c.is_ascii_alphabetic() {
+        Some(c.to_ascii_uppercase().to_string())
+    } else {
+        None
+    }
+}
+
+/// Libellé lisible d'une zone TEC.
+pub fn zone_label(zone: &str) -> &'static str {
+    match zone {
+        "B" => "Brabant wallon",
+        "C" => "Charleroi",
+        "H" => "Hainaut",
+        "L" => "Liège-Verviers",
+        "N" => "Namur",
+        "X" => "Luxembourg",
+        _ => "Autre",
     }
 }
 
@@ -110,6 +127,62 @@ pub fn commune_from_stop_name(name: &str) -> Option<String> {
             .or_else(|| Some(trimmed.to_string()));
     }
     Some(first.to_string())
+}
+
+/// Mesure d'annulation au niveau d'une ligne (service partiel vs total).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LineStatus {
+    pub route_id: String,
+    pub trips_scheduled: i64,
+    pub trips_cancelled: i64,
+    pub cancelled_ratio: f64,
+    pub status: NetworkStatus,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ZoneStatus {
+    pub zone: String,
+    pub label: String,
+    pub trips_scheduled: i64,
+    pub trips_cancelled: i64,
+    pub cancelled_ratio: f64,
+    pub status: NetworkStatus,
+    pub status_label: String,
+}
+
+impl ZoneStatus {
+    fn derive(zone: String, scheduled: i64, cancelled: i64, th: NetworkThresholds) -> Self {
+        let status = derive_status(scheduled, cancelled, th);
+        Self {
+            label: zone_label(&zone).to_string(),
+            cancelled_ratio: if scheduled > 0 {
+                cancelled as f64 / scheduled as f64
+            } else {
+                0.0
+            },
+            zone,
+            trips_scheduled: scheduled,
+            trips_cancelled: cancelled,
+            status,
+            status_label: status.label().to_string(),
+        }
+    }
+}
+
+/// Statut réseau dérivé des compteurs (mutualisé communes/zones).
+fn derive_status(scheduled: i64, cancelled: i64, th: NetworkThresholds) -> NetworkStatus {
+    if scheduled == 0 {
+        NetworkStatus::Normal
+    } else {
+        let ratio = cancelled as f64 / scheduled as f64;
+        if cancelled >= th.min_annulled && ratio >= th.critical_ratio {
+            NetworkStatus::Critical
+        } else if cancelled >= th.min_annulled && ratio >= th.degraded_ratio {
+            NetworkStatus::Degraded
+        } else {
+            NetworkStatus::Normal
+        }
+    }
 }
 
 /// Service de vue réseau (lecture seule sur GTFS + archive RT).
@@ -177,6 +250,73 @@ impl NetworkService {
         Ok(out)
     }
 
+    /// Part des courses d'une ligne annulée par alerte (service partiel vs total).
+    /// Calcul ciblé (une ligne) : pas de scan global.
+    pub fn line_ratio(&self, route_id: &str) -> Result<Option<LineStatus>> {
+        let scheduled: i64 = self.conn.query_row(
+            "SELECT COUNT(DISTINCT st.trip_id)
+             FROM gtfs.gtfs_stop_times st
+             JOIN gtfs.gtfs_trips t ON t.trip_id = st.trip_id
+             WHERE t.route_id = ?1",
+            params![route_id],
+            |r| r.get(0),
+        )?;
+        if scheduled == 0 {
+            return Ok(None);
+        }
+        let cancelled: i64 = self.conn.query_row(
+            "SELECT COUNT(DISTINCT at.trip_id)
+             FROM main.rt_alert_trips at
+             JOIN main.rt_alerts a ON a.alert_id = at.alert_id AND a.feed_ts = at.feed_ts
+             JOIN gtfs.gtfs_trips t ON t.trip_id = at.trip_id
+             WHERE at.feed_ts = (SELECT MAX(feed_ts) FROM main.rt_alerts)
+               AND a.effect IN (1, 2)
+               AND t.route_id = ?1",
+            params![route_id],
+            |r| r.get(0),
+        )?;
+        let ratio = cancelled as f64 / scheduled as f64;
+        Ok(Some(LineStatus {
+            route_id: route_id.to_string(),
+            trips_scheduled: scheduled,
+            trips_cancelled: cancelled,
+            cancelled_ratio: ratio,
+            status: derive_status(scheduled, cancelled, self.thresholds),
+        }))
+    }
+
+    /// Statut réseau par zone/dépôt TEC, trié par part d'annulation décroissante.
+    pub fn zones(&self) -> Result<Vec<ZoneStatus>> {
+        let has_stats: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM main.network_zones", [], |r| r.get(0))?;
+        if has_stats == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT zone, trips_scheduled, trips_cancelled FROM main.network_zones")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut out: Vec<ZoneStatus> = Vec::new();
+        for row in rows {
+            let (z, sched, ann) = row?;
+            out.push(ZoneStatus::derive(z, sched, ann, self.thresholds));
+        }
+        out.sort_by(|a, b| {
+            b.cancelled_ratio
+                .partial_cmp(&a.cancelled_ratio)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.trips_cancelled.cmp(&a.trips_cancelled))
+        });
+        Ok(out)
+    }
+
     /// Contexte réseau pour une commune (volet systémique vu d'une rue).
     pub fn commune(&self, commune: &str) -> Result<Option<CommuneStatus>> {
         Ok(self
@@ -185,35 +325,45 @@ impl NetworkService {
             .find(|c| c.commune.eq_ignore_ascii_case(commune)))
     }
 
-    /// Reconstruit la table matérialisée `network_stats`. **Coûteux** (scan des
-    /// `stop_times`) : à appeler une fois par cycle RT, jamais par requête HTTP.
+    /// Reconstruit les tables matérialisées `network_stats` (communes) et
+    /// `network_zones` (zones TEC). **Coûteux** (scan des `stop_times`) : à
+    /// appeler une fois par cycle RT, jamais par requête HTTP.
     pub fn rebuild_stats(&self) -> Result<usize> {
-        let mut scheduled: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        type Acc = HashMap<String, std::collections::HashSet<String>>;
+        let mut scheduled: Acc = HashMap::new();
+        let mut sched_zones: Acc = HashMap::new();
         let mut stmt = self.conn.prepare(
-            "SELECT s.stop_name, st.trip_id
+            "SELECT s.stop_name, st.trip_id, t.route_id
              FROM gtfs.gtfs_stop_times st
-             JOIN gtfs.gtfs_stops s ON s.stop_id = st.stop_id",
+             JOIN gtfs.gtfs_stops s ON s.stop_id = st.stop_id
+             JOIN gtfs.gtfs_trips t ON t.trip_id = st.trip_id",
         )?;
         let mut rows = stmt.query([])?;
         while let Some(r) = rows.next()? {
             let name: String = r.get(0)?;
             let trip: String = r.get(1)?;
+            let route: String = r.get(2)?;
             if let Some(c) = commune_from_stop_name(&name) {
-                scheduled.entry(c).or_default().insert(trip);
+                scheduled.entry(c).or_default().insert(trip.clone());
+            }
+            if let Some(z) = zone_from_route_id(&route) {
+                sched_zones.entry(z).or_default().insert(trip);
             }
         }
 
         let has_alerts: i64 =
             self.conn
                 .query_row("SELECT COUNT(*) FROM main.rt_alerts", [], |r| r.get(0))?;
-        let mut cancelled: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        let mut cancelled: Acc = HashMap::new();
+        let mut cancelled_zones: Acc = HashMap::new();
         if has_alerts > 0 {
             let mut stmt = self.conn.prepare(
-                "SELECT DISTINCT s.stop_name, at.trip_id
+                "SELECT DISTINCT s.stop_name, at.trip_id, t.route_id
                  FROM main.rt_alert_trips at
                  JOIN main.rt_alerts a ON a.alert_id = at.alert_id AND a.feed_ts = at.feed_ts
                  JOIN gtfs.gtfs_stop_times st ON st.trip_id = at.trip_id
                  JOIN gtfs.gtfs_stops s ON s.stop_id = st.stop_id
+                 JOIN gtfs.gtfs_trips t ON t.trip_id = at.trip_id
                  WHERE at.feed_ts = (SELECT MAX(feed_ts) FROM main.rt_alerts)
                    AND a.effect IN (1, 2)",
             )?;
@@ -221,14 +371,19 @@ impl NetworkService {
             while let Some(r) = rows.next()? {
                 let name: String = r.get(0)?;
                 let trip: String = r.get(1)?;
+                let route: String = r.get(2)?;
                 if let Some(c) = commune_from_stop_name(&name) {
-                    cancelled.entry(c).or_default().insert(trip);
+                    cancelled.entry(c).or_default().insert(trip.clone());
+                }
+                if let Some(z) = zone_from_route_id(&route) {
+                    cancelled_zones.entry(z).or_default().insert(trip);
                 }
             }
         }
 
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM main.network_stats", [])?;
+        tx.execute("DELETE FROM main.network_zones", [])?;
         {
             let mut ins = tx.prepare(
                 "INSERT OR REPLACE INTO main.network_stats
@@ -237,6 +392,16 @@ impl NetworkService {
             for (c, trips) in &scheduled {
                 let ann = cancelled.get(c).map(|s| s.len() as i64).unwrap_or(0);
                 ins.execute(params![c, trips.len() as i64, ann])?;
+            }
+        }
+        {
+            let mut ins = tx.prepare(
+                "INSERT OR REPLACE INTO main.network_zones
+                 (zone, trips_scheduled, trips_cancelled) VALUES (?1, ?2, ?3)",
+            )?;
+            for (z, trips) in &sched_zones {
+                let ann = cancelled_zones.get(z).map(|s| s.len() as i64).unwrap_or(0);
+                ins.execute(params![z, trips.len() as i64, ann])?;
             }
         }
         tx.commit()?;
@@ -263,6 +428,27 @@ mod tests {
             commune_from_stop_name("5810 LIEGE Centre"),
             Some("LIEGE".into())
         );
+    }
+
+    #[test]
+    fn zone_depuis_route_id() {
+        assert_eq!(
+            zone_from_route_id("gr:tec:L0002-24115").as_deref(),
+            Some("L")
+        );
+        assert_eq!(
+            zone_from_route_id("gr:tec:H4008-22717").as_deref(),
+            Some("H")
+        );
+        assert_eq!(
+            zone_from_route_id("gr:tec:C0001-21650").as_deref(),
+            Some("C")
+        );
+        assert_eq!(zone_from_route_id("gr:tec:x123").as_deref(), Some("X"));
+        assert_eq!(zone_from_route_id("rs:tec:1"), None);
+        assert_eq!(zone_from_route_id("gr:tec:0001"), None);
+        assert_eq!(zone_label("L"), "Liège-Verviers");
+        assert_eq!(zone_label("Z"), "Autre");
     }
 
     #[test]

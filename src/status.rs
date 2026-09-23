@@ -131,12 +131,15 @@ impl StatusService {
             };
             // Alerte sévère au niveau ligne (ex. service interrompu).
             let severe = alerts.no_service_routes.get(&route_id).map(String::as_str);
-            let (status, reason) = evaluate(&departures, rt_fresh, severe, self.thresholds);
+            let verdict = evaluate(&departures, rt_fresh, severe, self.thresholds);
+            let basis = verdict.basis();
             lines.push(LineStatus {
                 line: route,
-                status,
+                status: verdict.status,
                 departures,
-                reason,
+                reason: verdict.reason,
+                basis,
+                evidence: verdict.evidence,
             });
         }
         lines.sort_by(|a, b| a.line.short_name.cmp(&b.line.short_name));
@@ -250,13 +253,18 @@ impl StatusService {
             let _ = (route_ids, header);
         }
 
-        // 2) Alertes NO_SERVICE au niveau ligne : une ligne dont toutes les
-        //    courses sont annulées n'a pas forcément de trip ciblé par l'arrêt.
+        // 2) Alertes NO_SERVICE **sans course ciblée** = interruption de toute la
+        //    ligne. Celles qui ciblent des courses précises (cas courant chez TEC,
+        //    ex. « Annulations ») ne doivent PAS être lues comme « ligne à l'arrêt » :
+        //    seules les courses concernées le sont (traitées au point 1).
         let mut stmt = self.archive.prepare(
             "SELECT route_ids, header_fr, description_fr
-             FROM main.rt_alerts
-             WHERE feed_ts = (SELECT MAX(feed_ts) FROM main.rt_alerts)
-               AND effect = ?1 AND route_ids <> ''",
+             FROM main.rt_alerts a
+             WHERE a.feed_ts = (SELECT MAX(feed_ts) FROM main.rt_alerts)
+               AND a.effect = ?1 AND a.route_ids <> ''
+               AND NOT EXISTS (
+                   SELECT 1 FROM main.rt_alert_trips at
+                   WHERE at.alert_id = a.alert_id AND at.feed_ts = a.feed_ts)",
         )?;
         let rows = stmt.query_map([EFFECT_NO_SERVICE], |r| {
             Ok((
@@ -402,6 +410,152 @@ pub fn service_date(now: NaiveDateTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive::{AlertRecord, AlertTrip, Archive, Observation};
+    use crate::gtfs::GtfsRepo;
+    use chrono::NaiveDate;
+
+    /// Construit un couple GTFS+archive temporaire pour tester le croisement.
+    ///
+    /// GTFS : arrêt A desservi par la ligne r1 via 2 courses (t1, t2) à 10:00 et 10:30.
+    /// Archive : une alerte NO_SERVICE ciblant **t1 uniquement** (annulation partielle),
+    /// avec observation fraîche.
+    fn fixture(dir: &std::path::Path, now_secs: i64) -> StatusService {
+        let gtfs_path = dir.join("gtfs.sqlite");
+        let archive_path = dir.join("archive.sqlite");
+
+        // --- GTFS ---
+        let g = GtfsRepo::create_schema_at(&gtfs_path).unwrap();
+        g.execute(
+            "INSERT INTO gtfs_stops (stop_id, stop_name, lat, lon) VALUES ('A', 'LIEGE Test', 50.64, 5.57)",
+            [],
+        )
+        .unwrap();
+        g.execute(
+            "INSERT INTO gtfs_routes (route_id, short_name, long_name, route_type)
+             VALUES ('gr:tec:L0001', '1', 'Test', 3)",
+            [],
+        )
+        .unwrap();
+        g.execute(
+            "INSERT INTO gtfs_trips (trip_id, route_id, service_id, headsign)
+             VALUES ('t1', 'gr:tec:L0001', 'svc', 'Direc'), ('t2', 'gr:tec:L0001', 'svc', 'Direc')",
+            [],
+        )
+        .unwrap();
+        // Deux passages à 10:00 (t1) et 10:30 (t2), arrêt A.
+        g.execute(
+            "INSERT INTO gtfs_stop_times (trip_id, stop_sequence, stop_id, departure_secs)
+             VALUES ('t1', 1, 'A', 36000), ('t2', 1, 'A', 37800)",
+            [],
+        )
+        .unwrap();
+        // Service actif aujourd'hui (tous les jours).
+        let today = chrono::Utc::now()
+            .with_timezone(&Brussels)
+            .format("%Y%m%d")
+            .to_string();
+        g.execute(
+            "INSERT INTO gtfs_calendar
+             (service_id, monday, tuesday, wednesday, thursday, friday, saturday, sunday, start_date, end_date)
+             VALUES ('svc', 1,1,1,1,1,1,1, '20200101', '20301231')",
+            [],
+        )
+        .unwrap();
+        drop(g);
+        let _ = today;
+
+        // --- Archive RT ---
+        let mut a = Archive::open(&archive_path).unwrap();
+        let feed_ts = chrono::Utc::now().timestamp();
+        // Observation fraîche pour t1 (annulée) et t2 (à l'heure).
+        a.insert_observations(&[
+            Observation {
+                feed_ts,
+                captured_at: feed_ts,
+                trip_id: "t1".into(),
+                route_id: Some("gr:tec:L0001".into()),
+                stop_id: "A".into(),
+                stop_sequence: 1,
+                scheduled_ms: None,
+                predicted_ms: None,
+                delay_s: None,
+                schedule_relationship: 1, // SKIPPED
+            },
+            Observation {
+                feed_ts,
+                captured_at: feed_ts,
+                trip_id: "t2".into(),
+                route_id: Some("gr:tec:L0001".into()),
+                stop_id: "A".into(),
+                stop_sequence: 1,
+                scheduled_ms: Some(37_800_000),
+                predicted_ms: Some(37_860_000),
+                delay_s: Some(60),
+                schedule_relationship: 0,
+            },
+        ])
+        .unwrap();
+        a.insert_alerts(&[AlertRecord {
+            feed_ts,
+            captured_at: feed_ts,
+            alert_id: "rs:tec:1".into(),
+            agency_id: Some("tec".into()),
+            effect: Some(1), // NO_SERVICE
+            severity: Some(2),
+            cause: Some(2),
+            route_ids: "gr:tec:L0001".into(),
+            stop_ids: String::new(),
+            header_fr: Some("Annulations".into()),
+            description_fr: Some("Annulation voyage".into()),
+            active_from: None,
+            active_to: None,
+        }])
+        .unwrap();
+        // L'alerte cible t1, PAS la ligne entière.
+        a.insert_alert_trips(&[AlertTrip {
+            feed_ts,
+            alert_id: "rs:tec:1".into(),
+            trip_id: "t1".into(),
+            start_date: None,
+        }])
+        .unwrap();
+        drop(a);
+
+        let _ = now_secs;
+        StatusService::open(&gtfs_path, &archive_path).unwrap()
+    }
+
+    #[test]
+    fn alerte_ciblant_une_course_ne_rend_pas_la_ligne_arretee() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = fixture(dir.path(), 0);
+        // 09:55 locale : les deux passages (10:00, 10:30) sont dans la fenêtre.
+        let now = NaiveDate::from_ymd_opt(2026, 9, 23)
+            .unwrap()
+            .and_hms_opt(9, 55, 0)
+            .unwrap();
+        let st = svc.stop_status("A", now).unwrap().unwrap();
+        assert_eq!(st.lines.len(), 1, "une seule ligne");
+
+        let line = &st.lines[0];
+        // La ligne n'est PAS à l'arrêt : seule une course sur deux est annulée.
+        assert_ne!(
+            line.status,
+            ServiceStatus::Stopped,
+            "ligne ne doit pas être stoppée"
+        );
+        // Et la preuve doit mentionner l'annulation ciblée.
+        let cancelled = line
+            .evidence
+            .iter()
+            .any(|e| e.kind == crate::domain::EvidenceKind::Cancelled);
+        assert!(cancelled, "preuve d'annulation attendue");
+        // La course t1 est marquée annulée ; t2 ne l'est pas.
+        let t1 = line.departures.iter().find(|d| d.trip_id == "t1").unwrap();
+        let t2 = line.departures.iter().find(|d| d.trip_id == "t2").unwrap();
+        assert!(t1.cancelled, "t1 doit être annulée");
+        assert!(!t2.cancelled, "t2 ne doit pas être annulée");
+    }
 
     #[test]
     fn date_de_service() {

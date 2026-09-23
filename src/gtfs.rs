@@ -491,6 +491,14 @@ impl GtfsRepo {
         Ok(())
     }
 
+    /// Crée le schéma GTFS dans une base sur fichier (tests d'intégration).
+    #[cfg(test)]
+    pub(crate) fn create_schema_at(path: impl AsRef<Path>) -> Result<Connection> {
+        let conn = Connection::open(path)?;
+        conn.execute_batch(SCHEMA)?;
+        Ok(conn)
+    }
+
     /// Insère un arrêt et, si `served`, un service/trip/stop_time le desservant.
     #[cfg(test)]
     fn seed_stop(&self, stop_id: &str, name: &str, lat: f64, lon: f64, served: bool) -> Result<()> {
