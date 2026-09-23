@@ -44,6 +44,15 @@ CREATE TABLE IF NOT EXISTS rt_alerts (
     PRIMARY KEY (feed_ts, alert_id)
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_route ON rt_alerts(route_ids, feed_ts);
+
+CREATE TABLE IF NOT EXISTS rt_alert_trips (
+    feed_ts     INTEGER NOT NULL,
+    alert_id    TEXT    NOT NULL,
+    trip_id     TEXT    NOT NULL,
+    start_date  TEXT,
+    PRIMARY KEY (feed_ts, alert_id, trip_id)
+);
+CREATE INDEX IF NOT EXISTS idx_alert_trips_trip ON rt_alert_trips(trip_id, feed_ts);
 "#;
 
 /// Une observation de passage issue du feed `trip-update`.
@@ -79,6 +88,15 @@ pub struct AlertRecord {
     pub description_fr: Option<String>,
     pub active_from: Option<i64>,
     pub active_to: Option<i64>,
+}
+
+/// Lien alerte ↔ course : TEC cible les annulations sur une course précise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertTrip {
+    pub feed_ts: i64,
+    pub alert_id: String,
+    pub trip_id: String,
+    pub start_date: Option<String>,
 }
 
 pub struct Archive {
@@ -165,6 +183,27 @@ impl Archive {
         Ok(rows.len())
     }
 
+    pub fn insert_alert_trips(&mut self, rows: &[AlertTrip]) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO rt_alert_trips (feed_ts, alert_id, trip_id, start_date)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for r in rows {
+                stmt.execute(params![r.feed_ts, r.alert_id, r.trip_id, r.start_date])?;
+            }
+        }
+        tx.commit()?;
+        Ok(rows.len())
+    }
+
+    pub fn alert_trip_count(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM rt_alert_trips", [], |r| r.get(0))?)
+    }
+
     pub fn observation_count(&self) -> Result<i64> {
         Ok(self
             .conn
@@ -230,6 +269,35 @@ mod tests {
         // Nouveau feed_ts -> nouvelle ligne.
         a.insert_observations(&[obs(130, "t1", 1)]).unwrap();
         assert_eq!(a.observation_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn liens_alerte_course_inseres() {
+        let mut a = Archive::open_in_memory().unwrap();
+        let rows = vec![
+            AlertTrip {
+                feed_ts: 200,
+                alert_id: "rs:tec:1".into(),
+                trip_id: "gt:tec:t1".into(),
+                start_date: Some("20260924".into()),
+            },
+            AlertTrip {
+                feed_ts: 200,
+                alert_id: "rs:tec:1".into(),
+                trip_id: "gt:tec:t1".into(), // doublon -> idempotent
+                start_date: None,
+            },
+        ];
+        a.insert_alert_trips(&rows).unwrap();
+        assert_eq!(a.alert_trip_count().unwrap(), 1);
+        a.insert_alert_trips(&[AlertTrip {
+            feed_ts: 230,
+            alert_id: "rs:tec:1".into(),
+            trip_id: "gt:tec:t1".into(),
+            start_date: None,
+        }])
+        .unwrap();
+        assert_eq!(a.alert_trip_count().unwrap(), 2);
     }
 
     #[test]

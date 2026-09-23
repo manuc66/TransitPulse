@@ -1,7 +1,7 @@
 //! Service de statut : croise les horaires théoriques (GTFS statique) avec les
 //! observations temps réel archivées, et produit un `StopStatus` par arrêt.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use chrono::{NaiveDateTime, TimeZone, Timelike, Utc};
@@ -14,6 +14,10 @@ use crate::gtfs::GtfsRepo;
 /// Fenêtre de passage affichée (minutes de service).
 const HORIZON_MIN: i64 = 60;
 const MAX_DEPARTURES: usize = 12;
+
+/// Effets d'alerte GTFS-RT qui font qu'une course ne circule pas comme prévu.
+const EFFECT_NO_SERVICE: i64 = 1;
+const EFFECT_REDUCED_SERVICE: i64 = 2;
 
 pub struct StatusService {
     repo: GtfsRepo,
@@ -71,6 +75,9 @@ impl StatusService {
         let (rt, feed_age) = self.latest_rt_for_stop(stop_id, &services)?;
         let rt_fresh = feed_age.map(|a| a <= self.stale_after).unwrap_or(false);
 
+        // Alertes actives : lignes entièrement à l'arrêt et courses annulées.
+        let alerts = self.active_alerts_for_stop(stop_id)?;
+
         // Passages théoriques à l'arrêt (ou sur ses quais enfants).
         let stops = self.repo.station_stops(stop_id)?;
         let mut scheduled = Vec::new();
@@ -91,13 +98,14 @@ impl StatusService {
         for sd in scheduled {
             let key = (sd.trip_id.clone(), sd.stop_sequence);
             let rt_hit = rt.get(&key);
+            // Annulée si : arrêt sauté (RT) OU course ciblée par une alerte.
             let cancelled = rt_hit
                 .map(|o| o.schedule_relationship == 1)
-                .unwrap_or(false);
+                .unwrap_or(false)
+                || alerts.cancelled_trips.contains(&sd.trip_id);
             let observed = rt_hit
                 .and_then(|o| o.predicted_ms)
                 .and_then(|ms| Utc.timestamp_millis_opt(ms).single());
-            let _ = rt_hit.map(|o| o.delay_s);
             let scheduled_dt = day_secs_to_utc(now, sd.departure_secs);
             by_route
                 .entry(sd.route_id.clone())
@@ -116,7 +124,8 @@ impl StatusService {
             let Some(route) = self.repo.route(&route_id)? else {
                 continue;
             };
-            let severe = None; // les alertes sont croisées à l'étape suivante
+            // Alerte sévère au niveau ligne (ex. service interrompu).
+            let severe = alerts.no_service_routes.get(&route_id).map(String::as_str);
             let (status, reason) = evaluate(&departures, rt_fresh, severe, self.thresholds);
             lines.push(LineStatus {
                 line: route,
@@ -156,7 +165,7 @@ impl StatusService {
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT o.trip_id, o.stop_sequence, o.delay_s, o.predicted_ms, o.schedule_relationship, o.feed_ts
+            "SELECT o.trip_id, o.stop_sequence, o.predicted_ms, o.schedule_relationship, o.feed_ts
              FROM main.rt_observations o
              JOIN gtfs.gtfs_trips t ON t.trip_id = o.trip_id
              JOIN gtfs.gtfs_stop_times st ON st.trip_id = o.trip_id AND st.stop_sequence = o.stop_sequence
@@ -176,13 +185,12 @@ impl StatusService {
         while let Some(r) = rows.next()? {
             let trip_id: String = r.get(0)?;
             let seq: i64 = r.get(1)?;
-            feed_ts = Some(r.get::<_, i64>(5)?);
+            feed_ts = Some(r.get::<_, i64>(4)?);
             map.insert(
                 (trip_id, seq),
                 RtObs {
-                    delay_s: r.get(2)?,
-                    predicted_ms: r.get(3)?,
-                    schedule_relationship: r.get(4)?,
+                    predicted_ms: r.get(2)?,
+                    schedule_relationship: r.get(3)?,
                 },
             );
         }
@@ -201,6 +209,78 @@ impl StatusService {
                 .query_row("SELECT MAX(feed_ts) FROM rt_observations", [], |r| r.get(0))?;
         Ok(ts.map(|t| (Utc::now().timestamp() - t).max(0)))
     }
+
+    /// Alertes actives (dernier feed) concernant l'arrêt : routes entièrement
+    /// à l'arrêt (`effect=NO_SERVICE` sans course ciblée) et courses annulées.
+    fn active_alerts_for_stop(&self, stop_id: &str) -> Result<ActiveAlerts> {
+        let mut out = ActiveAlerts::default();
+
+        // 1) Annulations ciblant une course précise, dont cette course dessert
+        //    l'arrêt (ou l'un de ses quais enfants).
+        let no_svc = EFFECT_NO_SERVICE.to_string();
+        let reduced = EFFECT_REDUCED_SERVICE.to_string();
+        let mut stmt = self.archive.prepare(
+            "SELECT DISTINCT at.trip_id, a.route_ids, a.header_fr
+             FROM main.rt_alert_trips at
+             JOIN main.rt_alerts a ON a.alert_id = at.alert_id AND a.feed_ts = at.feed_ts
+             JOIN gtfs.gtfs_stop_times st ON st.trip_id = at.trip_id
+             WHERE st.stop_id = ?1
+               AND at.feed_ts = (SELECT MAX(feed_ts) FROM main.rt_alerts)
+               AND a.effect IN (?2, ?3)",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![stop_id, no_svc, reduced], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (trip_id, route_ids, header) = row?;
+            out.cancelled_trips.insert(trip_id);
+            let _ = (route_ids, header);
+        }
+
+        // 2) Alertes NO_SERVICE au niveau ligne : une ligne dont toutes les
+        //    courses sont annulées n'a pas forcément de trip ciblé par l'arrêt.
+        let mut stmt = self.archive.prepare(
+            "SELECT route_ids, header_fr, description_fr
+             FROM main.rt_alerts
+             WHERE feed_ts = (SELECT MAX(feed_ts) FROM main.rt_alerts)
+               AND effect = ?1 AND route_ids <> ''",
+        )?;
+        let rows = stmt.query_map([EFFECT_NO_SERVICE], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (route_ids, header, desc) = row?;
+            let msg = header
+                .or(desc)
+                .unwrap_or_else(|| "Service interrompu".into());
+            for rid in route_ids.split(',') {
+                if !rid.is_empty() {
+                    out.no_service_routes
+                        .entry(rid.to_string())
+                        .or_insert_with(|| msg.clone());
+                }
+            }
+        }
+
+        Ok(out)
+    }
+}
+
+/// Alertes actives résumées pour un arrêt.
+#[derive(Debug, Default)]
+struct ActiveAlerts {
+    /// `route_id` entièrement à l'arrêt -> message.
+    no_service_routes: HashMap<String, String>,
+    /// `trip_id` explicitement annulés par une alerte.
+    cancelled_trips: HashSet<String>,
 }
 
 /// Observations RT indexées par `(trip_id, stop_sequence)`.
@@ -208,7 +288,6 @@ type RtIndex = HashMap<(String, i64), RtObs>;
 
 #[derive(Debug, Clone, Copy)]
 struct RtObs {
-    delay_s: Option<i64>,
     predicted_ms: Option<i64>,
     schedule_relationship: i64,
 }

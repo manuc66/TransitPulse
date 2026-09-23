@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use tokio::sync::broadcast;
 
-use crate::archive::{AlertRecord, Archive, Observation};
+use crate::archive::{AlertRecord, AlertTrip, Archive, Observation};
 
 /// GTFS-RT `trip-update` officiel TEC (JSON).
 pub const DEFAULT_TRIP_UPDATES_URL: &str =
@@ -213,6 +213,20 @@ pub struct InformedEntity {
     pub route_id: Option<String>,
     #[serde(rename = "stopId", default)]
     pub stop_id: Option<String>,
+    #[serde(default)]
+    pub trip: Option<InformedTrip>,
+}
+
+/// `trip` imbriqué dans une entité informée d'alerte : identifie la course
+/// concernée (les alertes d'annulation TEC visent une course précise).
+#[derive(Debug, Deserialize, Serialize)]
+pub struct InformedTrip {
+    #[serde(rename = "tripId", default)]
+    pub trip_id: Option<String>,
+    #[serde(rename = "startDate", default)]
+    pub start_date: Option<String>,
+    #[serde(rename = "scheduleRelationship", default)]
+    pub schedule_relationship: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -298,9 +312,20 @@ pub fn observations_from(
     out
 }
 
+/// Résultat du parsing d'un feed `alert` : alertes + liens alerte↔course.
+#[derive(Debug, Default)]
+pub struct AlertsParsed {
+    pub records: Vec<AlertRecord>,
+    pub trips: Vec<AlertTrip>,
+}
+
 /// Construit les alertes archivables à partir d'un feed `alert`.
-pub fn alerts_from(feed_ts: i64, captured_at: i64, entities: &[AlertEntity]) -> Vec<AlertRecord> {
-    let mut out = Vec::new();
+///
+/// Les entités informées peuvent viser une ligne (`routeId`), un arrêt
+/// (`stopId`) **et/ou une course précise** (`trip.tripId`) — ce dernier cas est
+/// essentiel : les annulations TEC sont rattachées à une course, pas à un arrêt.
+pub fn alerts_from(feed_ts: i64, captured_at: i64, entities: &[AlertEntity]) -> AlertsParsed {
+    let mut out = AlertsParsed::default();
     for e in entities {
         let Some(alert) = &e.alert else { continue };
         let Some(alert_id) = e.id.clone() else {
@@ -323,7 +348,21 @@ pub fn alerts_from(feed_ts: i64, captured_at: i64, entities: &[AlertEntity]) -> 
             .collect();
         let period = alert.active_period.first();
 
-        out.push(AlertRecord {
+        // Courses ciblées par l'alerte (annulations précises).
+        for ie in &alert.informed_entity {
+            if let Some(trip) = &ie.trip
+                && let Some(trip_id) = &trip.trip_id
+            {
+                out.trips.push(AlertTrip {
+                    feed_ts,
+                    alert_id: alert_id.clone(),
+                    trip_id: trip_id.clone(),
+                    start_date: trip.start_date.clone(),
+                });
+            }
+        }
+
+        out.records.push(AlertRecord {
             feed_ts,
             captured_at,
             alert_id,
@@ -390,6 +429,7 @@ pub struct RtState {
     pub last_feed_ts: Option<i64>,
     pub observations_last: usize,
     pub alerts_last: usize,
+    pub alert_trips_last: usize,
     pub last_error: Option<String>,
 }
 
@@ -437,6 +477,7 @@ pub struct PollOutcome {
     pub feed_ts: i64,
     pub observations: usize,
     pub alerts: usize,
+    pub alert_trips: usize,
 }
 
 /// Un cycle complet : fetch des feeds, archivage brut, conversion, persistance.
@@ -453,10 +494,13 @@ pub async fn poll_once(
 
     let obs = observations_from(tu.header.timestamp, captured_at, &tu.entity);
     let alerts = alerts_from(al.header.timestamp, captured_at, &al.entity);
+    let alert_trips = alerts.trips;
+    let alert_records = alerts.records;
     let counts = PollOutcome {
         feed_ts: tu.header.timestamp,
         observations: obs.len(),
-        alerts: alerts.len(),
+        alerts: alert_records.len(),
+        alert_trips: alert_trips.len(),
     };
 
     let raw = raw.clone();
@@ -468,7 +512,8 @@ pub async fn poll_once(
         raw.append("alert", counts.feed_ts, &al_line)?;
         let mut a = archive.lock().expect("archive mutex empoisonné");
         a.insert_observations(&obs)?;
-        a.insert_alerts(&alerts)?;
+        a.insert_alerts(&alert_records)?;
+        a.insert_alert_trips(&alert_trips)?;
         Ok(())
     })
     .await??;
@@ -493,6 +538,7 @@ pub async fn run(
                     feed_ts = o.feed_ts,
                     observations = o.observations,
                     alerts = o.alerts,
+                    alert_trips = o.alert_trips,
                     "cycle RT archivé"
                 );
                 {
@@ -501,6 +547,7 @@ pub async fn run(
                     s.last_feed_ts = Some(o.feed_ts);
                     s.observations_last = o.observations;
                     s.alerts_last = o.alerts;
+                    s.alert_trips_last = o.alert_trips;
                     s.last_error = None;
                 }
                 // Diffuse l'événement (ignoré s'il n'y a aucun abonné).
@@ -553,7 +600,11 @@ mod tests {
       "entity": [
         {"id": "rs:tec:1", "alert": {
           "activePeriod": [{"start": 1788732060, "end": 7258114800}],
-          "informedEntity": [{"agencyId": "tec", "routeId": "gr:tec:H1078-23109", "stopId": "gs:tec:X"}],
+          "informedEntity": [
+            {"agencyId": "tec", "routeId": "gr:tec:H1078-23109", "stopId": "gs:tec:X"},
+            {"agencyId": "tec", "routeId": "gr:tec:L0032-20034",
+             "trip": {"tripId": "gt:tec:51596201-L_PA-09", "startDate": "20260924", "scheduleRelationship": 3}}
+          ],
           "cause": 10, "effect": 4, "severityLevel": 1,
           "headerText": {"translation": [{"language": "fr", "text": "Travaux"}]},
           "descriptionText": {"translation": [{"language": "fr", "text": "Ligne déviée"}]}
@@ -583,19 +634,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_alert() {
+    fn parse_alert_avec_course_ciblee() {
         let feed: Feed<AlertEntity> = serde_json::from_str(ALERT_FIXTURE).unwrap();
-        let alerts = alerts_from(feed.header.timestamp, 42, &feed.entity);
-        assert_eq!(alerts.len(), 1);
-        let a = &alerts[0];
+        let parsed = alerts_from(feed.header.timestamp, 42, &feed.entity);
+        assert_eq!(parsed.records.len(), 1);
+        let a = &parsed.records[0];
         assert_eq!(a.alert_id, "rs:tec:1");
         assert_eq!(a.agency_id.as_deref(), Some("tec"));
         assert_eq!(a.effect, Some(EFFECT_DETOUR));
-        assert_eq!(a.route_ids, "gr:tec:H1078-23109");
+        assert_eq!(a.route_ids, "gr:tec:H1078-23109,gr:tec:L0032-20034");
         assert_eq!(a.stop_ids, "gs:tec:X");
         assert_eq!(a.header_fr.as_deref(), Some("Travaux"));
         assert_eq!(a.description_fr.as_deref(), Some("Ligne déviée"));
         assert_eq!(a.active_from, Some(1_788_732_060));
+
+        // La course ciblée par l'alerte est extraite.
+        assert_eq!(parsed.trips.len(), 1);
+        let t = &parsed.trips[0];
+        assert_eq!(t.alert_id, "rs:tec:1");
+        assert_eq!(t.trip_id, "gt:tec:51596201-L_PA-09");
+        assert_eq!(t.start_date.as_deref(), Some("20260924"));
     }
 
     #[test]

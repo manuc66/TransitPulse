@@ -262,6 +262,7 @@ struct Freshness {
     stale: bool,
     observations_last: usize,
     alerts_last: usize,
+    alert_trips_last: usize,
     last_error: Option<String>,
 }
 
@@ -274,6 +275,7 @@ async fn freshness(State(state): State<AppState>) -> Json<Freshness> {
         stale: rt.is_stale(now, state.repo.thresholds.stale_feed_secs as i64),
         observations_last: rt.observations_last,
         alerts_last: rt.alerts_last,
+        alert_trips_last: rt.alert_trips_last,
         last_error: rt.last_error.clone(),
     })
 }
