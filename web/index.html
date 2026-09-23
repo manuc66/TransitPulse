@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TransitPulse</title>
+  <style>
+    :root { --bg:#0f1115; --card:#1a1d24; --muted:#8b93a1; --fg:#e7eaf0; }
+    * { box-sizing: border-box; }
+    body { margin:0; font:16px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+    header { padding:24px 16px 8px; max-width:760px; margin:0 auto; }
+    h1 { margin:0 0 4px; font-size:1.4rem; }
+    .sub { color:var(--muted); font-size:.9rem; }
+    main { max-width:760px; margin:0 auto; padding:16px; }
+    form { display:flex; gap:8px; margin:16px 0; }
+    input { flex:1; padding:12px 14px; border-radius:10px; border:1px solid #2a2f3a; background:var(--card); color:var(--fg); font-size:1rem; }
+    button { padding:12px 18px; border-radius:10px; border:0; background:#3b82f6; color:#fff; font-size:1rem; cursor:pointer; }
+    .hint { color:var(--muted); font-size:.85rem; }
+    .stop { margin-top:20px; }
+    .stop h2 { font-size:1.1rem; margin:0 0 2px; }
+    .feed { color:var(--muted); font-size:.8rem; margin-bottom:14px; }
+    .line { background:var(--card); border-radius:12px; padding:14px; margin:10px 0; border-left:5px solid var(--muted); }
+    .line-head { display:flex; align-items:center; gap:10px; }
+    .badge { width:30px; height:30px; border-radius:8px; display:grid; place-items:center; font-weight:700; background:#2a2f3a; }
+    .line-name { font-weight:600; }
+    .status { margin-left:auto; font-size:.85rem; padding:4px 10px; border-radius:999px; font-weight:600; }
+    .reason { color:var(--muted); font-size:.85rem; margin-top:6px; }
+    table { width:100%; border-collapse:collapse; margin-top:10px; font-size:.9rem; }
+    th,td { text-align:left; padding:4px 6px; border-bottom:1px solid #232833; }
+    th { color:var(--muted); font-weight:500; }
+    .advice { margin-top:16px; padding:12px 14px; border-radius:10px; background:#1e2430; font-weight:600; }
+    .normal{background:#14532d;color:#86efac} .perturbed{background:#78350f;color:#fdba74}
+    .reduced{background:#7c2d12;color:#fdba74} .stopped{background:#7f1d1d;color:#fca5a5}
+    .unknown{background:#374151;color:#d1d5db}
+    .s-normal{border-left-color:#22c55e} .s-perturbed{border-left-color:#f59e0b}
+    .s-reduced{border-left-color:#f97316} .s-stopped{border-left-color:#ef4444}
+    .s-unknown{border-left-color:#6b7280}
+    .err { color:#fca5a5; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>TransitPulse</h1>
+    <div class="sub">Les bus circulent-ils comme prévu dans ma rue, maintenant&nbsp;?</div>
+  </header>
+  <main>
+    <form id="search">
+      <input id="q" placeholder="Rue, adresse ou arrêt (ex. Opéra, République…)" autocomplete="off" />
+      <button>Chercher</button>
+    </form>
+    <div class="hint">Données fictives (Liège) — en attendant le raccordement aux feeds TEC.</div>
+    <div id="results"></div>
+  </main>
+
+  <script>
+    const LABEL = { normal:"Normal", perturbed:"Perturbé", reduced:"Réduit", stopped:"À l'arrêt", unknown:"Inconnu" };
+    const fmt = iso => new Date(iso).toLocaleTimeString("fr-BE", { hour:"2-digit", minute:"2-digit" });
+
+    document.getElementById("search").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const q = document.getElementById("q").value.trim();
+      const box = document.getElementById("results");
+      box.innerHTML = "";
+      if (!q) return;
+      try {
+        const stops = await (await fetch(`/api/search?q=${encodeURIComponent(q)}`)).json();
+        if (!stops.length) { box.innerHTML = '<p class="hint">Aucun arrêt trouvé.</p>'; return; }
+        for (const s of stops) {
+          const st = await (await fetch(`/api/status?stop=${encodeURIComponent(s.stop_id)}`)).json();
+          box.appendChild(renderStop(st));
+        }
+      } catch (err) {
+        box.innerHTML = `<p class="err">Erreur : ${err.message}</p>`;
+      }
+    });
+
+    function renderStop(st) {
+      const el = document.createElement("div");
+      el.className = "stop";
+      const maj = st.last_updated ? `Dernière mise à jour : ${fmt(st.last_updated)} (il y a ${st.feed_age_secs ?? "?"} s)` : "Mise à jour inconnue";
+      el.innerHTML = `<h2>${st.stop.name}</h2><div class="feed">${maj}</div>`;
+      for (const l of st.lines) {
+        const rows = l.departures.map(d => {
+          const obs = d.cancelled ? "annulé" : (d.observed ? fmt(d.observed) : "—");
+          const delta = (!d.cancelled && d.observed)
+            ? Math.round((new Date(d.observed) - new Date(d.scheduled)) / 60000) : null;
+          const deltaTxt = delta === null ? "—" : (delta > 0 ? `+${delta} min` : "à l'heure");
+          return `<tr><td>${l.line.short_name}</td><td>${d.headsign}</td><td>${fmt(d.scheduled)}</td><td>${obs}</td><td>${deltaTxt}</td></tr>`;
+        }).join("");
+        const div = document.createElement("div");
+        div.className = `line s-${l.status}`;
+        div.innerHTML = `
+          <div class="line-head">
+            <div class="badge">${l.line.short_name}</div>
+            <div>
+              <div class="line-name">${l.line.long_name}</div>
+            </div>
+            <span class="status ${l.status}">${LABEL[l.status]}</span>
+          </div>
+          ${l.reason ? `<div class="reason">${l.reason}</div>` : ""}
+          <table>
+            <thead><tr><th>Ligne</th><th>Direction</th><th>Prévu</th><th>Observé</th><th>Écart</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>`;
+        el.appendChild(div);
+      }
+      const advice = document.createElement("div");
+      advice.className = "advice";
+      advice.textContent = st.advice;
+      el.appendChild(advice);
+      return el;
+    }
+  </script>
+</body>
+</html>

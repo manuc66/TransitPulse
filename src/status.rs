@@ -1,0 +1,282 @@
+//! Service de statut : croise les horaires théoriques (GTFS statique) avec les
+//! observations temps réel archivées, et produit un `StopStatus` par arrêt.
+
+use std::collections::HashMap;
+
+use anyhow::Result;
+use chrono::{NaiveDateTime, TimeZone, Timelike, Utc};
+use chrono_tz::Europe::Brussels;
+use rusqlite::Connection;
+
+use crate::domain::{self, Departure, LineStatus, ServiceStatus, StopStatus, Thresholds, evaluate};
+use crate::gtfs::GtfsRepo;
+
+/// Fenêtre de passage affichée (minutes de service).
+const HORIZON_MIN: i64 = 60;
+const MAX_DEPARTURES: usize = 12;
+
+pub struct StatusService {
+    repo: GtfsRepo,
+    archive: Connection,
+    thresholds: Thresholds,
+    stale_after: i64,
+}
+
+impl StatusService {
+    pub fn open(
+        gtfs_path: impl AsRef<std::path::Path>,
+        archive_path: impl AsRef<std::path::Path>,
+    ) -> Result<Self> {
+        let archive = Connection::open(archive_path)?;
+        // La jointure statique↔temps réel traverse deux bases : on attache le
+        // GTFS à la connexion archive sous le nom `gtfs`.
+        let gtfs_path = gtfs_path.as_ref();
+        archive.execute(
+            "ATTACH DATABASE ?1 AS gtfs",
+            rusqlite::params![gtfs_path.to_string_lossy()],
+        )?;
+        Ok(Self {
+            repo: GtfsRepo::open(gtfs_path)?,
+            archive,
+            thresholds: Thresholds::default(),
+            stale_after: Thresholds::default().stale_feed_secs as i64,
+        })
+    }
+
+    /// Heure locale Bruxelles, celle attendue par `stop_status`.
+    pub fn now_brussels() -> NaiveDateTime {
+        Utc::now().with_timezone(&Brussels).naive_local()
+    }
+
+    pub fn with_thresholds(mut self, thresholds: Thresholds, stale_after: i64) -> Self {
+        self.thresholds = thresholds;
+        self.stale_after = stale_after;
+        self
+    }
+
+    /// Statut complet d'un arrêt : lignes, prochains passages, statut, aide.
+    ///
+    /// `now` doit être en **heure locale Bruxelles** (les horaires GTFS le sont).
+    pub fn stop_status(&self, stop_id: &str, now: NaiveDateTime) -> Result<Option<StopStatus>> {
+        let Some(stop) = self.repo.stop(stop_id)? else {
+            return Ok(None);
+        };
+        // Date/heure locales (Europe/Brussels), sans dépendance TZ externe.
+        let yyyymmdd = now.format("%Y%m%d").to_string();
+        let now_secs =
+            (now.time().hour() * 3600 + now.time().minute() * 60 + now.time().second()) as i64;
+        let services = self.repo.active_services(&yyyymmdd)?;
+
+        // Obs. RT fraîches indexées par (trip_id, stop_sequence).
+        let (rt, feed_age) = self.latest_rt_for_stop(stop_id, &services)?;
+        let rt_fresh = feed_age.map(|a| a <= self.stale_after).unwrap_or(false);
+
+        // Passages théoriques à l'arrêt (ou sur ses quais enfants).
+        let stops = self.repo.station_stops(stop_id)?;
+        let mut scheduled = Vec::new();
+        for s in &stops {
+            scheduled.extend(self.repo.departures_at_stop(
+                &s.stop_id,
+                &services,
+                now_secs,
+                HORIZON_MIN * 60,
+                MAX_DEPARTURES,
+            )?);
+        }
+        scheduled.sort_by_key(|d| d.departure_secs);
+        scheduled.truncate(MAX_DEPARTURES);
+
+        // Regroupe par ligne.
+        let mut by_route: HashMap<String, Vec<Departure>> = HashMap::new();
+        for sd in scheduled {
+            let key = (sd.trip_id.clone(), sd.stop_sequence);
+            let rt_hit = rt.get(&key);
+            let cancelled = rt_hit
+                .map(|o| o.schedule_relationship == 1)
+                .unwrap_or(false);
+            let observed = rt_hit
+                .and_then(|o| o.predicted_ms)
+                .and_then(|ms| Utc.timestamp_millis_opt(ms).single());
+            let _ = rt_hit.map(|o| o.delay_s);
+            let scheduled_dt = day_secs_to_utc(now, sd.departure_secs);
+            by_route
+                .entry(sd.route_id.clone())
+                .or_default()
+                .push(Departure {
+                    trip_id: sd.trip_id,
+                    headsign: sd.headsign,
+                    scheduled: scheduled_dt,
+                    observed,
+                    cancelled,
+                });
+        }
+
+        let mut lines = Vec::new();
+        for (route_id, departures) in by_route {
+            let Some(route) = self.repo.route(&route_id)? else {
+                continue;
+            };
+            let severe = None; // les alertes sont croisées à l'étape suivante
+            let (status, reason) = evaluate(&departures, rt_fresh, severe, self.thresholds);
+            lines.push(LineStatus {
+                line: route,
+                status,
+                departures,
+                reason,
+            });
+        }
+        lines.sort_by(|a, b| a.line.short_name.cmp(&b.line.short_name));
+
+        let worst = lines
+            .iter()
+            .map(|l| l.status)
+            .min_by_key(|s| severity_rank(*s))
+            .unwrap_or(ServiceStatus::Unknown);
+
+        Ok(Some(StopStatus {
+            stop,
+            lines,
+            last_updated: feed_age.map(|a| Utc::now() - chrono::Duration::seconds(a)),
+            feed_age_secs: feed_age.map(|a| a.max(0) as u64),
+            advice: domain::advice(worst).to_string(),
+        }))
+    }
+
+    /// Dernières observations RT pour les `trip_id` desservant l'arrêt.
+    fn latest_rt_for_stop(
+        &self,
+        stop_id: &str,
+        services: &[String],
+    ) -> Result<(RtIndex, Option<i64>)> {
+        if services.is_empty() {
+            return Ok((HashMap::new(), None));
+        }
+        let placeholders = (0..services.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT o.trip_id, o.stop_sequence, o.delay_s, o.predicted_ms, o.schedule_relationship, o.feed_ts
+             FROM main.rt_observations o
+             JOIN gtfs.gtfs_trips t ON t.trip_id = o.trip_id
+             JOIN gtfs.gtfs_stop_times st ON st.trip_id = o.trip_id AND st.stop_sequence = o.stop_sequence
+             WHERE st.stop_id = ?1 AND t.service_id IN ({placeholders})
+               AND o.feed_ts = (SELECT MAX(feed_ts) FROM main.rt_observations)"
+        );
+        let mut stmt = self.archive.prepare(&sql)?;
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(stop_id.to_string())];
+        for s in services {
+            binds.push(Box::new(s.clone()));
+        }
+        let params_ref: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+
+        let mut map = HashMap::new();
+        let mut feed_ts = None;
+        let mut rows = stmt.query(params_ref.as_slice())?;
+        while let Some(r) = rows.next()? {
+            let trip_id: String = r.get(0)?;
+            let seq: i64 = r.get(1)?;
+            feed_ts = Some(r.get::<_, i64>(5)?);
+            map.insert(
+                (trip_id, seq),
+                RtObs {
+                    delay_s: r.get(2)?,
+                    predicted_ms: r.get(3)?,
+                    schedule_relationship: r.get(4)?,
+                },
+            );
+        }
+
+        // Âge du feed = maintenant - feed_ts observé.
+        let age = match feed_ts {
+            Some(ts) => Some((Utc::now().timestamp() - ts).max(0)),
+            None => self.latest_feed_age()?,
+        };
+        Ok((map, age))
+    }
+
+    fn latest_feed_age(&self) -> Result<Option<i64>> {
+        let ts: Option<i64> =
+            self.archive
+                .query_row("SELECT MAX(feed_ts) FROM rt_observations", [], |r| r.get(0))?;
+        Ok(ts.map(|t| (Utc::now().timestamp() - t).max(0)))
+    }
+}
+
+/// Observations RT indexées par `(trip_id, stop_sequence)`.
+type RtIndex = HashMap<(String, i64), RtObs>;
+
+#[derive(Debug, Clone, Copy)]
+struct RtObs {
+    delay_s: Option<i64>,
+    predicted_ms: Option<i64>,
+    schedule_relationship: i64,
+}
+
+/// Convertit un horaire GTFS (secondes depuis minuit, heure locale Bruxelles)
+/// en instant UTC, pour la date de service `now`.
+fn day_secs_to_utc(now: NaiveDateTime, secs: i64) -> chrono::DateTime<Utc> {
+    let date = now.date();
+    let naive = date.and_hms_opt(0, 0, 0).unwrap() + chrono::Duration::seconds(secs);
+    // Heure locale Bruxelles -> UTC (gère l'heure d'été/hiver).
+    match Brussels.from_local_datetime(&naive).earliest() {
+        Some(dt) => dt.with_timezone(&Utc),
+        None => Utc.from_utc_datetime(&naive), // heure ambiguë (passage DST)
+    }
+}
+
+fn severity_rank(s: ServiceStatus) -> u8 {
+    match s {
+        ServiceStatus::Stopped => 0,
+        ServiceStatus::Reduced => 1,
+        ServiceStatus::Perturbed => 2,
+        ServiceStatus::Unknown => 3,
+        ServiceStatus::Normal => 4,
+    }
+}
+
+/// Récupère le jour de service courant au format `YYYYMMDD` (utile aux tests).
+pub fn service_date(now: NaiveDateTime) -> String {
+    now.format("%Y%m%d").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn date_de_service() {
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 9, 23)
+            .unwrap()
+            .and_hms_opt(8, 30, 0)
+            .unwrap();
+        assert_eq!(service_date(d), "20260923");
+        assert_eq!(
+            crate::gtfs::weekday_column(&service_date(d)).unwrap(),
+            "wednesday"
+        );
+    }
+
+    #[test]
+    fn conversion_secondes_vers_utc_gere_heure_ete() {
+        // 23/09/2026 : Bruxelles est en heure d'été (UTC+2).
+        // 05:07 local -> 03:07 UTC.
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 9, 23)
+            .unwrap()
+            .and_hms_opt(8, 0, 0)
+            .unwrap();
+        let dt = day_secs_to_utc(now, 5 * 3600 + 7 * 60);
+        assert_eq!(dt.format("%H:%M").to_string(), "03:07");
+    }
+
+    #[test]
+    fn conversion_secondes_vers_utc_gere_heure_hiver() {
+        // 15/01/2026 : Bruxelles en heure d'hiver (UTC+1). 05:07 -> 04:07 UTC.
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
+            .unwrap()
+            .and_hms_opt(8, 0, 0)
+            .unwrap();
+        let dt = day_secs_to_utc(now, 5 * 3600 + 7 * 60);
+        assert_eq!(dt.format("%H:%M").to_string(), "04:07");
+    }
+}
