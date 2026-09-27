@@ -11,8 +11,10 @@ async fn main() -> anyhow::Result<()> {
         .user_agent("TransitPulse/0.1")
         .build()?;
     let t = Instant::now();
-    let stats = gtfs::fetch_and_load(&client, url, cache, db).await?;
-    println!("ETL en {:?}: {:?}", t.elapsed(), stats);
+    // `0` : le ZIP en cache est toujours considéré périmé, cet outil sert à
+    // forcer un rechargement complet.
+    let load = gtfs::fetch_and_load(&client, url, cache, db, 0).await?;
+    println!("ETL en {:?}: {:?}", t.elapsed(), load);
 
     let repo = gtfs::GtfsRepo::open(db)?;
     for q in ["Opéra", "Guillemins", "République"] {

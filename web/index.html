@@ -115,7 +115,7 @@
       <button>Chercher</button>
       <button type="button" id="geo" class="ghost" title="Utiliser ma position">Ma position</button>
     </form>
-    <div class="hint" id="hint">Cherchez un arrêt puis « Suivre ». Vous pouvez en suivre plusieurs (domicile, travail, aller/retour…).</div>
+    <div class="hint" id="hint">Cherchez un arrêt puis « Suivre ». Vous pouvez en suivre plusieurs et les nommer à votre goût.</div>
     <ul id="choices" class="results"></ul>
 
     <section class="tracked">
@@ -241,10 +241,17 @@
       save(); renderTracked(); connect(s.stop_id);
       document.querySelector(`[data-stop="${CSS.escape(s.stop_id)}"]`)?.scrollIntoView({ behavior:"smooth", block:"center" });
     }
+    // L'application ne connaît ni votre domicile ni votre lieu de travail :
+    // elle ne peut donc pas les nommer à votre place. Le libellé reste
+    // librement saisissable, mais on ne pré-remplit qu'un identifiant neutre.
+    // Les suggestions (« Domicile », « Travail »…) ne sont plus qu'un placeholder.
     function defaultRole() {
       const used = new Set(tracked.map(t => t.role));
-      const prefs = ["Domicile", "Travail", "Embarquement", "Débarquement", "Aller", "Retour"];
-      return prefs.find(p => !used.has(p)) || "Arrêt";
+      for (let i = 1; i <= tracked.length + 1; i++) {
+        const candidate = `Arrêt ${i}`;
+        if (!used.has(candidate)) return candidate;
+      }
+      return "Arrêt";
     }
     function remove(stop_id) {
       tracked = tracked.filter(t => t.stop_id !== stop_id);
@@ -272,7 +279,7 @@
         card.className = "stop"; card.dataset.stop = t.stop_id;
         card.innerHTML = `
           <div class="stop-head">
-            <input class="role-input" value="${escapeAttr(t.role)}" title="Nommez ce point (Domicile, Travail…)" aria-label="Nom du point suivi">
+            <input class="role-input" value="${escapeAttr(t.role)}" placeholder="Domicile, Travail, Aller…" title="Nommez ce point comme vous le souhaitez" aria-label="Nom du point suivi">
             <span class="stop-title">${escapeHtml(t.name || t.stop_id)}</span>
             <div class="stop-actions"><button class="icon-btn danger" title="Ne plus suivre">Retirer</button></div>
           </div>

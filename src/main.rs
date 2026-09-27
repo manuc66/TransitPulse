@@ -50,14 +50,19 @@ async fn main() -> anyhow::Result<()> {
 
     // ETL statique : télécharge si besoin, charge SQLite, puis ignore les échecs
     // (l'app retombe alors sur le jeu fictif plutôt que de refuser de démarrer).
+    // Un ZIP en cache déjà décrit par `tec.sqlite` fait sauter le rechargement.
     let gtfs_db = Path::new(&data_dir).join("tec.sqlite");
     let cache = gtfs::gtfs_cache_path(Path::new(&data_dir));
     let gtfs_url =
         std::env::var("TRANSITPULSE_GTFS_URL").unwrap_or_else(|_| gtfs::TEC_GTFS_URL.to_string());
+    let gtfs_max_age: u64 = std::env::var("TRANSITPULSE_GTFS_MAX_AGE_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(gtfs::DEFAULT_GTFS_MAX_AGE_DAYS);
     let (gtfs_repo, status_svc, network_svc) =
-        match gtfs::fetch_and_load(&client, &gtfs_url, &cache, &gtfs_db).await {
-            Ok(stats) => {
-                tracing::info!(?stats, "GTFS statique chargé");
+        match gtfs::fetch_and_load(&client, &gtfs_url, &cache, &gtfs_db, gtfs_max_age).await {
+            Ok(load) => {
+                tracing::info!(?load, "GTFS statique disponible");
                 let repo = GtfsRepo::open(&gtfs_db)?;
                 let svc = StatusService::open(&gtfs_db, &db_path)?;
                 let net = NetworkService::open(&gtfs_db, &db_path)?;
@@ -75,17 +80,40 @@ async fn main() -> anyhow::Result<()> {
 
     let (events_tx, _events_rx) = tokio::sync::broadcast::channel(64);
 
-    // Reconstruction de la vue réseau à chaque cycle RT (coûteuse : sortie du
-    // chemin de requête HTTP).
+    // Reconstruction de la vue réseau : une fois au démarrage, puis à chaque
+    // cycle RT. Seul le premier passage scanne le GTFS statique (~5 s) ; les
+    // suivants ne recalculent que les annulations, en quelques ms. Le rebuild
+    // reste hors du chemin de requête HTTP (`spawn_blocking`), mais il tient le
+    // `Mutex` du service : le faire au démarrage évite de bloquer `/api/network`
+    // toutes les 30 s une fois l'application en service.
     if let Some(net) = &network_svc {
         let net = net.clone();
         let mut rx = events_tx.subscribe();
         tokio::spawn(async move {
+            let net_initial = net.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let started = std::time::Instant::now();
+                match net_initial.lock().expect("network mutex").rebuild_stats() {
+                    Ok(n) => tracing::info!(
+                        communes = n,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "vue réseau initiale construite"
+                    ),
+                    Err(e) => tracing::warn!(error = %e, "rebuild réseau initial échoué"),
+                }
+            })
+            .await;
+
             while rx.recv().await.is_ok() {
                 let net = net.clone();
                 let _ = tokio::task::spawn_blocking(move || {
+                    let started = std::time::Instant::now();
                     match net.lock().expect("network mutex").rebuild_stats() {
-                        Ok(n) => tracing::debug!(communes = n, "vue réseau reconstruite"),
+                        Ok(n) => tracing::debug!(
+                            communes = n,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "vue réseau reconstruite"
+                        ),
                         Err(e) => tracing::warn!(error = %e, "rebuild réseau échoué"),
                     }
                 })

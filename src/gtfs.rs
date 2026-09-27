@@ -5,6 +5,16 @@
 //! chargés dans `data/tec.sqlite` (`shapes.txt` est ignoré).
 //!
 //! Le schéma SQLite et la lecture associée (dépôt `GtfsRepo`) vivent ici.
+//!
+//! Deux garde-fous gardent la base lisible et son poids stable :
+//!
+//! - le chargement se fait dans un fichier jetable (`tec.sqlite.new`) puis est
+//!   renommé sur la cible. Un ETL interrompu laisse donc l'ancienne base
+//!   intacte au lieu d'une base à moitié écrite — `journal_mode=OFF`, rendu
+//!   nécessaire par la vitesse sur 5,6 M de lignes, interdit tout rollback ;
+//! - l'empreinte du ZIP source est mémorisée dans `gtfs_meta`. Au démarrage
+//!   suivant, un feed inchangé réutilise la base telle quelle au lieu de
+//!   réécrire ~1 Go pendant une vingtaine de secondes.
 
 use std::io::{BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
@@ -18,6 +28,16 @@ use crate::domain::{Line, Stop, TransportMode};
 pub const TEC_GTFS_URL: &str = "https://opendata-discovery-gtfs-static.api.production.belgianmobility.io/api/gtfs/feed/tec/static";
 /// Repli (portail opendata de l'opérateur).
 pub const TEC_GTFS_URL_FALLBACK: &str = "https://opendata.tec-wl.be/Current%20GTFS/TEC-GTFS.zip";
+
+/// Fraîcheur par défaut du ZIP en cache, en jours.
+pub const DEFAULT_GTFS_MAX_AGE_DAYS: u64 = 7;
+
+/// Version du schéma GTFS embarqué, écrite dans `gtfs_meta`.
+///
+/// À incrémenter dès que `SCHEMA` change : une base dont la version ne
+/// correspond plus est considérée incompatible et reconstruite, au lieu de
+/// laisser `GtfsRepo` lire des colonnes absentes.
+const SCHEMA_VERSION: &str = "1";
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS gtfs_stops (
@@ -58,8 +78,11 @@ CREATE TABLE IF NOT EXISTS gtfs_stop_times (
     departure_secs  INTEGER,
     PRIMARY KEY (trip_id, stop_sequence)
 );
-CREATE INDEX IF NOT EXISTS idx_st_idx_stop  ON gtfs_stop_times(stop_id);
-CREATE INDEX IF NOT EXISTS idx_st_idx_trip  ON gtfs_stop_times(trip_id);
+-- Index sur gtfs_stop_times : voir `idx_st_idx_stop`, créé après le chargement.
+-- Il est volontairement ABSENT du schéma : maintenir un index pendant
+-- l'insertion des 5,6 M de lignes coûte ~40 % du temps de l'ETL.
+-- trip_id n'a pas besoin d'index : c'est la première colonne du PRIMARY KEY,
+-- qui sert déjà les jointures par course.
 
 CREATE TABLE IF NOT EXISTS gtfs_calendar (
     service_id  TEXT PRIMARY KEY,
@@ -124,24 +147,163 @@ fn calendar_columns() -> [&'static str; 10] {
     ]
 }
 
-/// Télécharge (si absent) le ZIP GTFS sous `cache_path` et le charge dans SQLite.
+/// Télécharge le ZIP GTFS sous `cache_path` s'il est absent ou périmé, puis le
+/// charge dans SQLite — sauf si la base existante décrit déjà ce ZIP.
+///
+/// `max_age_days` borne la fraîcheur du ZIP en cache : sans cela, le « on ne
+/// recharge que si l'empreinte change » gèlerait le réseau sur le premier
+/// téléchargement.
+///
+/// Un rafraîchissement qui échoue n'est pas fatal tant qu'un cache utilisable
+/// reste sur disque : perdre le réseau un jour de péremption ne doit pas faire
+/// tomber l'application sur le jeu fictif alors que `tec.sqlite` est complet.
 pub async fn fetch_and_load(
     client: &reqwest::Client,
     url: &str,
     cache_path: &Path,
     db_path: &Path,
-) -> Result<GtfsStats> {
-    if !cache_path.exists() {
-        if let Some(parent) = cache_path.parent() {
-            std::fs::create_dir_all(parent)?;
+    max_age_days: u64,
+) -> Result<GtfsLoad> {
+    let zip_age = zip_age_days(cache_path);
+    if zip_age.is_none_or(|age| age >= max_age_days) {
+        tracing::info!(
+            age_days = zip_age,
+            max_age_days,
+            "ZIP GTFS absent ou périmé — téléchargement"
+        );
+        if let Err(e) = download_with_fallback(client, url, cache_path).await {
+            if cache_path.exists() {
+                tracing::warn!(error = %e, "rafraîchissement impossible — cache conservé");
+            } else {
+                return Err(e);
+            }
         }
-        let bytes = download_with_fallback(client, url, cache_path).await?;
-        tracing::info!(size = bytes, "GTFS mis en cache");
     }
+    let fingerprint = zip_fingerprint(cache_path)?;
+
+    if is_reusable(db_path, &fingerprint)? {
+        tracing::info!(path = %db_path.display(), "GTFS déjà chargé — ETL sauté");
+        return Ok(GtfsLoad::Reused);
+    }
+
     // Le parsing est CPU/IO lourds : on le sort du runtime async.
     let cache = cache_path.to_path_buf();
     let db = db_path.to_path_buf();
-    tokio::task::spawn_blocking(move || load_zip_into_sqlite(&cache, &db)).await?
+    let fp = fingerprint.clone();
+    let started = std::time::Instant::now();
+    let stats =
+        tokio::task::spawn_blocking(move || load_zip_into_sqlite(&cache, &db, &fp)).await??;
+    tracing::info!(elapsed_s = started.elapsed().as_secs(), "GTFS rechargé");
+    Ok(GtfsLoad::Loaded { stats })
+}
+
+/// Résultat d'un appel à [`fetch_and_load`].
+#[derive(Debug, Clone, Copy)]
+pub enum GtfsLoad {
+    /// La base existante décrit déjà le ZIP en cache : rien n'a été écrit.
+    Reused,
+    /// ZIP éventuellement rafraîchi, puis base reconstruite.
+    Loaded { stats: GtfsStats },
+}
+
+/// Ancienneté du ZIP en cache, en jours entiers. `None` s'il n'existe pas.
+fn zip_age_days(zip_path: &Path) -> Option<u64> {
+    let mtime = std::fs::metadata(zip_path).ok()?.modified().ok()?;
+    let age = std::time::SystemTime::now()
+        .duration_since(mtime)
+        .ok()?
+        .as_secs();
+    Some(age / 86_400)
+}
+
+/// Empreinte du ZIP source : taille + date de modification, pas son contenu.
+///
+/// Volontairement O(1) : elle est lue à chaque démarrage, et le but est
+/// justement d'éviter de relire 85 Mo. Une collision demanderait deux ZIP de
+/// même taille posés à la même seconde.
+fn zip_fingerprint(zip_path: &Path) -> Result<String> {
+    let md = std::fs::metadata(zip_path).with_context(|| format!("stat {}", zip_path.display()))?;
+    let mtime = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Ok(format!("{}:{mtime}", md.len()))
+}
+
+/// Lit une clé de `gtfs_meta`. `None` si absente, table absente ou base illisible.
+fn read_meta(conn: &Connection, key: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM gtfs_meta WHERE key = ?1",
+        params![key],
+        |r| r.get(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+fn write_meta(conn: &Connection, pairs: &[(&str, &str)]) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    for (k, v) in pairs {
+        tx.execute(
+            "INSERT OR REPLACE INTO gtfs_meta (key, value) VALUES (?1, ?2)",
+            params![k, v],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// La base existante peut-elle être réutilisée telle quelle ?
+///
+/// Trois conditions, toutes nécessaires :
+///
+/// - le schéma embarqué correspond à celui qui a écrit la base, sinon les
+///   colonnes lues par `GtfsRepo` peuvent ne plus exister ;
+/// - l'empreinte du ZIP est celle du fichier en cache, donc le réseau n'a pas
+///   bougé depuis le dernier chargement ;
+/// - les tables sont réellement peuplées. C'est le filet qui rattrape les bases
+///   mutilées : ETL interrompu, disque plein, suppression manuelle.
+///   `gtfs_stop_times` vide en est le symptôme typique — les trips sont
+///   chargés en premier et donnent l'impression que tout va bien.
+///
+/// Une base qui échoue n'est pas une erreur fatale : elle est reconstruite.
+fn is_reusable(db_path: &Path, fingerprint: &str) -> Result<bool> {
+    if !db_path.exists() {
+        return Ok(false);
+    }
+    let conn = match Connection::open(db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "base GTFS illisible — rechargement");
+            return Ok(false);
+        }
+    };
+    if read_meta(&conn, "schema_version").as_deref() != Some(SCHEMA_VERSION) {
+        return Ok(false);
+    }
+    if read_meta(&conn, "zip_fingerprint").as_deref() != Some(fingerprint) {
+        return Ok(false);
+    }
+    let count = |t: &str| -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
+            .unwrap_or(0)
+    };
+    let (trips, stop_times) = (count("gtfs_trips"), count("gtfs_stop_times"));
+    if trips == 0 || stop_times == 0 {
+        tracing::warn!(trips, stop_times, "base GTFS incomplète — rechargement");
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Fichier de construction jetable, à côté de la base cible (`tec.sqlite.new`).
+fn staging_path(db_path: &Path) -> PathBuf {
+    let mut s = db_path.as_os_str().to_os_string();
+    s.push(".new");
+    PathBuf::from(s)
 }
 
 /// Télécharge le ZIP, en essayant `url` puis `TEC_GTFS_URL_FALLBACK`.
@@ -189,8 +351,23 @@ pub struct GtfsStats {
     pub calendar_dates: usize,
 }
 
-/// Charge un ZIP GTFS dans une base SQLite (créée/écrasée).
-pub fn load_zip_into_sqlite(zip_path: &Path, db_path: &Path) -> Result<GtfsStats> {
+/// Charge un ZIP GTFS dans `db_path`, en le remplaçant atomiquement.
+///
+/// Le travail se fait dans `tec.sqlite.new`, un fichier jetable renommé sur la
+/// cible une fois complet. Deux bénéfices :
+///
+/// - `journal_mode=OFF` (justifié par les 5,6 M de lignes) devient sans risque,
+///   puisque la base jetable est abandonnée en cas d'échec ou d'interruption ;
+/// - la base cible n'est plus `DELETE`-puis-remplie, elle ne conserve donc pas
+///   de pages libérées en fin de fichier. Un `VACUUM` serait alors inutile.
+///
+/// `fingerprint` est mémorisé dans `gtfs_meta` une fois la base complète : c'est
+/// ce qui permet à [`is_reusable`] de sauter l'ETL au démarrage suivant.
+pub fn load_zip_into_sqlite(
+    zip_path: &Path,
+    db_path: &Path,
+    fingerprint: &str,
+) -> Result<GtfsStats> {
     let file = std::fs::File::open(zip_path)
         .with_context(|| format!("ouverture {}", zip_path.display()))?;
     let mut zip = zip::ZipArchive::new(file).context("lecture ZIP GTFS")?;
@@ -198,46 +375,84 @@ pub fn load_zip_into_sqlite(zip_path: &Path, db_path: &Path) -> Result<GtfsStats
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let staging = staging_path(db_path);
+    // Un reliquat d'un run interrompu ferait échouer la publication finale.
+    let _ = std::fs::remove_file(&staging);
+
+    match build_sqlite(&mut zip, &staging, fingerprint) {
+        Ok(stats) => {
+            std::fs::rename(&staging, db_path).with_context(|| {
+                format!(
+                    "publication de {} vers {}",
+                    staging.display(),
+                    db_path.display()
+                )
+            })?;
+            // La base remplacée ne peut plus avoir de WAL : ces fichiers
+            // appartenaient à l'ancienne et iraient à sa suite.
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let mut s = db_path.as_os_str().to_os_string();
+                s.push(suffix);
+                let _ = std::fs::remove_file(PathBuf::from(s));
+            }
+            Ok(stats)
+        }
+        Err(e) => {
+            // La cible n'a pas été touchée : on ne garde que le déchet.
+            let _ = std::fs::remove_file(&staging);
+            Err(e)
+        }
+    }
+}
+
+/// Remplit une base SQLite neuve à partir des CSV du ZIP.
+fn build_sqlite<R: Read + Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    db_path: &Path,
+    fingerprint: &str,
+) -> Result<GtfsStats> {
     let conn = Connection::open(db_path)?;
     conn.pragma_update(None, "journal_mode", "OFF")?;
     conn.pragma_update(None, "synchronous", "OFF")?;
-    // Rebuild : on vide toutes les tables avant rechargement.
     conn.execute_batch(SCHEMA)?;
-    for t in [
-        "gtfs_stop_times",
-        "gtfs_trips",
-        "gtfs_routes",
-        "gtfs_stops",
-        "gtfs_calendar_dates",
-        "gtfs_calendar",
-        "gtfs_meta",
-    ] {
-        conn.execute(&format!("DELETE FROM {t}"), [])?;
-    }
 
+    // Base neuve : aucune table à vider, aucun index à retirer.
     let mut stats = GtfsStats::default();
     {
         let tx = conn.unchecked_transaction()?;
-        with_reader(&mut zip, "stops.txt", |r| load_stops(&tx, r, &mut stats))?;
-        with_reader(&mut zip, "routes.txt", |r| load_routes(&tx, r, &mut stats))?;
-        with_reader(&mut zip, "trips.txt", |r| load_trips(&tx, r, &mut stats))?;
-        with_reader(&mut zip, "stop_times.txt", |r| {
+        with_reader(zip, "stops.txt", |r| load_stops(&tx, r, &mut stats))?;
+        with_reader(zip, "routes.txt", |r| load_routes(&tx, r, &mut stats))?;
+        with_reader(zip, "trips.txt", |r| load_trips(&tx, r, &mut stats))?;
+        with_reader(zip, "stop_times.txt", |r| {
             load_stop_times(&tx, r, &mut stats)
         })?;
-        with_reader(&mut zip, "calendar.txt", |r| {
-            load_calendar(&tx, r, &mut stats)
-        })?;
-        with_reader(&mut zip, "calendar_dates.txt", |r| {
+        with_reader(zip, "calendar.txt", |r| load_calendar(&tx, r, &mut stats))?;
+        with_reader(zip, "calendar_dates.txt", |r| {
             load_calendar_dates(&tx, r, &mut stats)
         })?;
         tx.commit()?;
     }
-    // Index construits après l'insertion : beaucoup plus rapide.
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_st_idx_stop ON gtfs_stop_times(stop_id);
-         CREATE INDEX IF NOT EXISTS idx_st_idx_trip ON gtfs_stop_times(trip_id);",
-    )?;
+    // Index créé après l'insertion : maintenir un index ligne par ligne pendant
+    // le chargement des 5,6 M de stop_times coûte ~40 % du temps de l'ETL.
+    // Mesuré sur le ZIP TEC complet : 24,1 s -> 15,1 s, et 1,30 Go -> 0,96 Go
+    // de base (l'index sur trip_id, redondant avec le PRIMARY KEY, pesait
+    // pour ~340 Mo à lui seul).
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_st_idx_stop ON gtfs_stop_times(stop_id);")?;
     conn.execute_batch("ANALYZE;")?;
+    // L'empreinte n'est écrite qu'ici, après le dernier INSERT : c'est elle
+    // qui autorise `is_reusable` à sauter l'ETL au démarrage suivant.
+    write_meta(
+        &conn,
+        &[
+            ("schema_version", SCHEMA_VERSION),
+            ("zip_fingerprint", fingerprint),
+            ("loaded_at", &chrono::Utc::now().to_rfc3339()),
+            ("stops", &stats.stops.to_string()),
+            ("routes", &stats.routes.to_string()),
+            ("trips", &stats.trips.to_string()),
+            ("stop_times", &stats.stop_times.to_string()),
+        ],
+    )?;
     Ok(stats)
 }
 
@@ -929,6 +1144,124 @@ pub fn gtfs_cache_path(data_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Construit un ZIP GTFS minimal mais complet (toutes les entrées attendues
+    /// par `build_sqlite`).
+    fn write_minimal_zip(path: &Path) {
+        let mut w = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        let put = |w: &mut zip::ZipWriter<std::fs::File>, name: &str, body: &str| {
+            w.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(w, body.as_bytes()).unwrap();
+        };
+        let stop = "stop_id,stop_name,stop_lat,stop_lon\nA,Arret A,50.64,5.57\n";
+        let route = "route_id,route_short_name,route_long_name,route_type\nr1,1,Ligne 1,3\n";
+        let trip = "trip_id,route_id,service_id,trip_headsign\nt1,r1,s1,Direction\n";
+        let st =
+            "trip_id,arrival_time,departure_time,stop_id,stop_sequence\nt1,07:00:00,07:00:00,A,1\n";
+        let cal = "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\ns1,1,1,1,1,1,0,0,20260101,20261231\n";
+        let cald = "service_id,date,exception_type\n";
+        for (n, b) in [
+            ("stops.txt", stop),
+            ("routes.txt", route),
+            ("trips.txt", trip),
+            ("stop_times.txt", st),
+            ("calendar.txt", cal),
+            ("calendar_dates.txt", cald),
+        ] {
+            put(&mut w, n, b);
+        }
+        w.finish().unwrap();
+    }
+
+    #[test]
+    fn base_fraiche_est_reutilisee_et_chargee_dans_un_fichier_neuf() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("feed.zip");
+        let db_path = dir.path().join("tec.sqlite");
+        write_minimal_zip(&zip_path);
+
+        let fp = zip_fingerprint(&zip_path).unwrap();
+        let stats = load_zip_into_sqlite(&zip_path, &db_path, &fp).unwrap();
+        assert_eq!(stats.trips, 1);
+        assert_eq!(stats.stop_times, 1);
+
+        // L'empreinte et la version sont bien mémorisées, et la base est
+        // considérée réutilisable.
+        assert!(is_reusable(&db_path, &fp).unwrap());
+        let conn = Connection::open(&db_path).unwrap();
+        assert_eq!(read_meta(&conn, "schema_version").as_deref(), Some("1"));
+        assert_eq!(
+            read_meta(&conn, "zip_fingerprint").as_deref(),
+            Some(fp.as_str())
+        );
+        // Aucun fichier de construction ne doit subsister.
+        assert!(!staging_path(&db_path).exists());
+    }
+
+    #[test]
+    fn empreinte_changee_ou_base_absente_force_le_rechargement() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("tec.sqlite");
+        // Base absente.
+        assert!(!is_reusable(&db_path, "peu-importe").unwrap());
+
+        let zip_path = dir.path().join("feed.zip");
+        write_minimal_zip(&zip_path);
+        let fp = zip_fingerprint(&zip_path).unwrap();
+        load_zip_into_sqlite(&zip_path, &db_path, &fp).unwrap();
+        assert!(is_reusable(&db_path, &fp).unwrap());
+
+        // Nouveau ZIP (même taille possible, mtime différent) -> rechargement.
+        assert!(!is_reusable(&db_path, "autre-empreinte").unwrap());
+    }
+
+    #[test]
+    fn base_incomplete_est_rechargee() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("feed.zip");
+        let db_path = dir.path().join("tec.sqlite");
+        write_minimal_zip(&zip_path);
+        let fp = zip_fingerprint(&zip_path).unwrap();
+        load_zip_into_sqlite(&zip_path, &db_path, &fp).unwrap();
+
+        // Symptôme d'un ETL interrompu : trips chargés, stop_times vides. La
+        // base paraît saine côté trips, elle doit pourtant être rejetée.
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("DELETE FROM gtfs_stop_times", []).unwrap();
+        drop(conn);
+
+        assert!(!is_reusable(&db_path, &fp).unwrap());
+    }
+
+    #[test]
+    fn etl_interrompu_laisse_la_base_anterieure_intacte() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("feed.zip");
+        let db_path = dir.path().join("tec.sqlite");
+        write_minimal_zip(&zip_path);
+        let fp = zip_fingerprint(&zip_path).unwrap();
+        load_zip_into_sqlite(&zip_path, &db_path, &fp).unwrap();
+
+        // Un ZIP sans `stop_times.txt` fait échouer le chargement au milieu.
+        let bad_zip = dir.path().join("bad.zip");
+        {
+            let mut w = zip::ZipWriter::new(std::fs::File::create(&bad_zip).unwrap());
+            let opt = zip::write::SimpleFileOptions::default();
+            w.start_file("stops.txt", opt).unwrap();
+            std::io::Write::write_all(
+                &mut w,
+                b"stop_id,stop_name,stop_lat,stop_lon\nB,B,50.1,5.1\n",
+            )
+            .unwrap();
+            w.finish().unwrap();
+        }
+        assert!(load_zip_into_sqlite(&bad_zip, &db_path, "autre").is_err());
+
+        // L'échec ne doit avoir ni touché la base, ni laissé de déchet.
+        assert!(is_reusable(&db_path, &fp).unwrap());
+        assert!(!staging_path(&db_path).exists());
+    }
 
     #[test]
     fn parse_heure_gtfs() {

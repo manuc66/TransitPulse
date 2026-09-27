@@ -313,10 +313,11 @@ impl StatusService {
         let mut stmt = self.archive.prepare(
             "SELECT DISTINCT at.trip_id, a.route_ids, a.header_fr
              FROM main.rt_alert_trips at
-             JOIN main.rt_alerts a ON a.alert_id = at.alert_id AND a.feed_ts = at.feed_ts
+             JOIN main.rt_alerts a ON a.alert_id = at.alert_id
              JOIN gtfs.gtfs_stop_times st ON st.trip_id = at.trip_id
              WHERE st.stop_id = ?1
-               AND at.feed_ts = (SELECT MAX(feed_ts) FROM main.rt_alerts)
+               AND a.last_seen = (SELECT MAX(last_seen) FROM main.rt_alerts)
+               AND at.last_seen = a.last_seen
                AND a.effect IN (?2, ?3)",
         )?;
         let rows = stmt.query_map(rusqlite::params![stop_id, no_svc, reduced], |r| {
@@ -339,11 +340,12 @@ impl StatusService {
         let mut stmt = self.archive.prepare(
             "SELECT route_ids, header_fr, description_fr
              FROM main.rt_alerts a
-             WHERE a.feed_ts = (SELECT MAX(feed_ts) FROM main.rt_alerts)
+             WHERE a.last_seen = (SELECT MAX(last_seen) FROM main.rt_alerts)
                AND a.effect = ?1 AND a.route_ids <> ''
                AND NOT EXISTS (
                    SELECT 1 FROM main.rt_alert_trips at
-                   WHERE at.alert_id = a.alert_id AND at.feed_ts = a.feed_ts)",
+                   WHERE at.alert_id = a.alert_id
+                     AND at.last_seen = a.last_seen)",
         )?;
         let rows = stmt.query_map([EFFECT_NO_SERVICE], |r| {
             Ok((
@@ -688,6 +690,116 @@ mod tests {
         let t2 = line.departures.iter().find(|d| d.trip_id == "t2").unwrap();
         assert!(t1.cancelled, "t1 doit être annulée");
         assert!(!t2.cancelled, "t2 ne doit pas être annulée");
+    }
+
+    /// Une alerte `NO_SERVICE` sans course ciblée arrête bien toute la ligne,
+    /// et cesse de le faire dès qu'elle disparaît du feed.
+    ///
+    /// C'est le test qui verrouille la déduplication des alertes : l'archive ne
+    /// conserve plus qu'une ligne par `alert_id`, la présence dans le feed
+    /// courant se lit via `last_seen`. Si ce test passe, le sélecteur
+    /// `last_seen = (SELECT MAX(last_seen) ...)` fait bien le lien.
+    #[test]
+    fn alerte_sans_course_ciblee_arrete_la_ligne_puis_cesse() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = fixture(dir.path(), 0);
+        let now = NaiveDate::from_ymd_opt(2026, 9, 23)
+            .unwrap()
+            .and_hms_opt(9, 55, 0)
+            .unwrap();
+
+        // 1) L'alerte de la fixture cible t1 : la ligne n'est pas arrêtée.
+        let st = svc.stop_status("A", now).unwrap().unwrap();
+        assert_ne!(st.lines[0].status, ServiceStatus::Stopped);
+
+        // 2) On ajoute une alerte de ligne entière, sans course ciblée.
+        let feed_ts = chrono::Utc::now().timestamp();
+        let mut a = Archive::open(dir.path().join("archive.sqlite")).unwrap();
+        a.insert_alerts(&[AlertRecord {
+            feed_ts,
+            captured_at: feed_ts,
+            alert_id: "rs:tec:whole-line".into(),
+            agency_id: Some("tec".into()),
+            effect: Some(1), // NO_SERVICE
+            severity: Some(1),
+            cause: Some(2),
+            route_ids: "gr:tec:L0001".into(),
+            stop_ids: String::new(),
+            header_fr: Some("Ligne interrompue".into()),
+            description_fr: None,
+            active_from: None,
+            active_to: None,
+        }])
+        .unwrap();
+        drop(a);
+        let svc = StatusService::open(
+            dir.path().join("gtfs.sqlite"),
+            dir.path().join("archive.sqlite"),
+        )
+        .unwrap();
+        let st = svc.stop_status("A", now).unwrap().unwrap();
+        assert_eq!(
+            st.lines[0].status,
+            ServiceStatus::Stopped,
+            "ligne entierelement arretee"
+        );
+
+        // 3) Cycle suivant où l'alerte de ligne entière n'est plus annoncée,
+        //    mais où celle de la fixture l'est toujours. Elle reste en base
+        //    (historique) mais n'est plus « courante ».
+        //    Rejouer une alerte au nouveau `feed_ts` est nécessaire : le
+        //    sentinelle « feed courant » est `MAX(last_seen)`, il n'avance que
+        //    si au moins une alerte est ré-annoncée.
+        let feed_ts = feed_ts + 30;
+        let mut a = Archive::open(dir.path().join("archive.sqlite")).unwrap();
+        a.insert_observations(&[Observation {
+            feed_ts,
+            captured_at: feed_ts,
+            trip_id: "t2".into(),
+            route_id: Some("gr:tec:L0001".into()),
+            stop_id: "A".into(),
+            stop_sequence: 1,
+            scheduled_ms: Some(37_800_000),
+            predicted_ms: Some(37_860_000),
+            delay_s: Some(60),
+            schedule_relationship: 0,
+        }])
+        .unwrap();
+        a.insert_alerts(&[AlertRecord {
+            feed_ts,
+            captured_at: feed_ts,
+            alert_id: "rs:tec:1".into(),
+            agency_id: Some("tec".into()),
+            effect: Some(1),
+            severity: Some(2),
+            cause: Some(2),
+            route_ids: "gr:tec:L0001".into(),
+            stop_ids: String::new(),
+            header_fr: Some("Annulations".into()),
+            description_fr: Some("Annulation voyage".into()),
+            active_from: None,
+            active_to: None,
+        }])
+        .unwrap();
+        a.insert_alert_trips(&[AlertTrip {
+            feed_ts,
+            alert_id: "rs:tec:1".into(),
+            trip_id: "t1".into(),
+            start_date: None,
+        }])
+        .unwrap();
+        drop(a);
+        let svc = StatusService::open(
+            dir.path().join("gtfs.sqlite"),
+            dir.path().join("archive.sqlite"),
+        )
+        .unwrap();
+        let st = svc.stop_status("A", now).unwrap().unwrap();
+        assert_ne!(
+            st.lines[0].status,
+            ServiceStatus::Stopped,
+            "l'alerte disparue ne doit plus arreter la ligne"
+        );
     }
 
     #[test]
